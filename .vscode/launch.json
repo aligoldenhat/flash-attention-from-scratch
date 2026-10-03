@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Needs the "NVIDIA Nsight Visual Studio Code Edition" extension.
+      // Debug preset = -G (device debug info). Never benchmark this build.
+      "name": "CUDA: debug fa_dev",
+      "type": "cuda-gdb",
+      "request": "launch",
+      "debuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+      "program": "${workspaceFolder}/build/debug/fa_dev",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build debug",
+      // true = stop at the first instruction of every kernel launch
+      "breakOnLaunch": false
+    }
+  ]
+}

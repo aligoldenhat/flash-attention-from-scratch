@@ -1,0 +1,5 @@
+{
+    // The plain `clangd` on PATH is v21, which can't fully parse CUDA 13 + GCC 15 headers.
+    "clangd.path": "clangd-22",
+    "clangd.arguments": ["--header-insertion=never"]
+}

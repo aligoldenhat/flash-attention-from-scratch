@@ -1,0 +1,9 @@
+# Like ruff format's config: pick a base style, override a few things.
+# All options: https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 4
+AccessModifierOffset: -4
+DerivePointerAlignment: false
+PointerAlignment: Left # float* A, not float *A
+AllowShortFunctionsOnASingleLine: Inline

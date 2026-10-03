@@ -1,0 +1,70 @@
+# clangd parses .cu files with clang's own CUDA support, not nvcc.
+# compile_commands.json contains nvcc-only flags that clang doesn't know,
+# so strip them and tell clang where CUDA is and which GPU to target.
+# Reference: NVIDIA/cccl's .clangd. All options: https://clangd.llvm.org/config
+
+# Headers (.cuh) have no entry in compile_commands.json, so clangd guesses
+# their flags. Force CUDA mode so __global__, threadIdx, etc. are understood.
+If:
+  PathMatch: .*\.cuh?
+CompileFlags:
+  Add:
+    - -xcuda
+
+---
+
+CompileFlags:
+  CompilationDatabase: build/debug
+  Remove:
+    # nvcc driver flags
+    - -forward-unknown-to-host-compiler
+    - -Xcompiler*
+    - -ccbin*
+    - --options-file
+    # GPU architecture flags (replaced by --cuda-gpu-arch below)
+    - --generate-code*
+    - -gencode*
+    - -arch*
+    # nvcc code-generation / debug flags
+    - -lineinfo
+    - -G
+    - -rdc*
+    - --expt-relaxed-constexpr
+    - --use_fast_math
+    - --expt-extended-lambda
+    - --extended-lambda
+    # nvcc's own warning flags
+    - -Wreorder
+    - --Wext-lambda-captures-this
+    - --Werror*
+  Add:
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_86
+    - --no-cuda-version-check   # CUDA 13.1 may be newer than clang knows
+    - -Wno-unknown-cuda-version
+    - -ferror-limit=0           # show all errors, not just the first 20
+
+---
+
+# csrc/bindings.cpp is built by setup.py, not CMake, so it has no compile_commands.json
+# entry and clangd would borrow a CUDA file's flags (no PyTorch include paths).
+# Give it its own flags: plain C++20 + PyTorch / Python headers, as setup.py does.
+# MACHINE-SPECIFIC absolute paths: regenerate on a new machine with
+#   .venv/bin/python -c "import sysconfig, torch.utils.cpp_extension as c; print(sysconfig.get_paths()['include'], c.include_paths())"
+If:
+  PathMatch: csrc/bindings\.cpp
+CompileFlags:
+  CompilationDatabase: None
+  Remove:
+    - --cuda-*
+    - --no-cuda-version-check
+  Add:
+    - -xc++
+    - -std=c++20
+    - -I/home/ali/code/cuda/flash-attention-from-scratch/csrc
+    - -isystem/home/ali/code/cuda/flash-attention-from-scratch/.venv/lib/python3.12/site-packages/torch/include
+    - -isystem/home/ali/code/cuda/flash-attention-from-scratch/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
+    - -isystem/home/ali/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/include/python3.12
+    - -isystem/usr/local/cuda/include
+    - -DTORCH_EXTENSION_NAME=_C
+    - -DTORCH_API_INCLUDE_EXTENSION_H

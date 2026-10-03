@@ -1,0 +1,81 @@
+# Like ruff's `select` / `ignore`: enable check groups, then disable noisy ones.
+# List of checks: https://clang.llvm.org/extra/clang-tidy/checks/list.html
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  cppcoreguidelines-*,
+  clang-analyzer-*,
+  misc-*,
+  portability-*,
+  -misc-non-private-member-variables-in-classes,
+  -misc-use-anonymous-namespace,
+  -misc-use-internal-linkage,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-macro-usage,
+  -bugprone-easily-swappable-parameters,
+  -readability-math-missing-parentheses,
+  -readability-uppercase-literal-suffix,
+  -modernize-use-integer-sign-comparison,
+  -portability-avoid-pragma-once,
+  -misc-include-cleaner,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -cppcoreguidelines-avoid-c-arrays,
+  -modernize-avoid-c-arrays,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cppcoreguidelines-pro-type-reinterpret-cast
+
+# Disabled above, and why:
+#   trailing-return-type     : style preference (auto f() -> int), not a bug
+#   identifier-length        : short math names (i, j, M, N, K, A, B, C) are standard in numeric code
+#   magic-numbers            : block/tile sizes like 32, 64, 128 are everywhere in kernels
+#   pointer-arithmetic,
+#   constant-array-index     : unavoidable in kernels (A[row * K + k])
+#   macro-usage              : CUDA_CHECK(...) must be a macro to report __FILE__/__LINE__
+#   pro-type-reinterpret-cast: kernels need typed views of raw shared memory, 16-byte vector
+#                              loads/stores (uint4) and half2 <-> uint32 register reinterpretation
+#   easily-swappable-params  : numeric code takes (int M, int N, int K, ...) all the time
+#   misc-non-private-member..: plain structs (e.g. a Timer or Config) are fine
+#   misc-use-anonymous-ns,
+#   misc-use-internal-linkage: want every free function in main.cu marked static
+#                              or in an anonymous namespace; noisy for a single-file
+#                              program (llama.cpp and cccl disable these too)
+#   math-missing-parentheses : wants A[(row * K) + k]; index math is everywhere
+#   uppercase-literal-suffix : wants 1.0F instead of 1.0f
+#   integer-sign-comparison  : suggests std::cmp_less(), which can't be called
+#                              from device code (it's not __device__)
+#   avoid-pragma-once        : #pragma once is supported by every compiler we use
+# (llama.cpp disables the first two; cccl disables integer-sign-comparison)
+#   avoid-c-arrays          : `__shared__ float As[N]` and per-thread `float acc[TM]`
+#                              must be plain arrays (std::array can't live in shared
+#                              memory, and register arrays need constant bounds)
+#   implicit-widening-of-mult: kernels do index math in int (`A += cRow * BS * K`),
+#                              as in the article: fine below ~46k x 46k. Host code
+#                              still uses size_t explicitly where sizes can be large.
+#   include-cleaner          : CUDA's runtime API (cudaMalloc, dim3, ...) is
+#                              included implicitly by nvcc, so every call is flagged
+#   pro-type-vararg          : flags printf; fine for a benchmark's output (cccl disables)
+#   unchecked-container-acc. : flags every v[i]; would force .at() everywhere
+#
+# Enabled groups: clang-analyzer = path-sensitive bug finder (null deref, leaks),
+# misc = assorted checks, portability = platform-dependent code.
+
+WarningsAsErrors: ""
+HeaderFilterRegex: "src/.*"
+
+CheckOptions:
+  # `do { ... } while (0)` is the standard idiom for multi-statement macros
+  # (CUDA_CHECK). Still warn on real do-while loops, just not inside macros.
+  - key: cppcoreguidelines-avoid-do-while.IgnoreMacros
+    value: true
+  # Each CUDA_CHECK(...) hides a do + if, so 10 checked calls would count
+  # as 10 nested branches. Score only the logic we actually wrote.
+  - key: readability-function-cognitive-complexity.IgnoreMacros
+    value: true
