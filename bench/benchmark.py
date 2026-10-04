@@ -8,12 +8,17 @@ i.e. B = 16384 / N and H = 2048 / d, so every N does comparable total work per t
 
 Timing: CUDA events around each call, warmup first, median of many iterations.
 FLOPs = 4 * B * H * N^2 * d (two matmuls of 2*N^2*d each), halved for causal.
+
+Each implementation gets a setup step outside the timed region (layout conversion to its
+native format, planning), so every library is timed on its own preferred input layout.
 """
 
 import argparse
 import csv
 import math
+import os
 import statistics
+import sys
 from pathlib import Path
 
 import torch
@@ -24,19 +29,65 @@ import fa
 from fa.reference import attention_naive_fp16
 
 
+# FlashInfer compiles its kernels on first use with ninja, which it looks up on PATH; make the
+# venv's ninja visible even when this script is run as .venv/bin/python without activating.
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
+try:
+    import flashinfer
+except ImportError:  # optional baseline
+    flashinfer = None
+
+
+def _identity(o):
+    return o
+
+
+# An implementation is a setup function: setup(q, k, v, causal) -> (run, to_bhnd), where
+# run() is what gets timed and to_bhnd converts its output back to [B, H, N, d] for the
+# correctness check.
+def _simple(fn):
+    def setup(q, k, v, causal):
+        return (lambda: fn(q, k, v, causal)), _identity
+
+    return setup
+
+
 def _sdpa(backend):
     def run(q, k, v, causal):
         with sdpa_kernel(backend):
             return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
 
-    return run
+    return _simple(run)
 
 
 def _ours(variant):
-    def run(q, k, v, causal):
-        return fa.forward_variant(q, k, v, causal=causal, variant=variant)
+    return _simple(lambda q, k, v, causal: fa.forward_variant(q, k, v, causal=causal, variant=variant))
 
-    return run
+
+_FLASHINFER_WORKSPACE = None
+
+
+def _flashinfer(fp16_qk):
+    """FlashInfer batch prefill on its native ragged token-major layout [B*N, H, d].
+    fp16_qk: FlashInfer's own fp16-accumulation option (for Q K^T)."""
+
+    def setup(q, k, v, causal):
+        global _FLASHINFER_WORKSPACE
+        b, h, n, d = q.shape
+        if _FLASHINFER_WORKSPACE is None:
+            _FLASHINFER_WORKSPACE = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+        def to_nhd(x):
+            return x.transpose(1, 2).reshape(b * n, h, d).contiguous()
+
+        qn, kn, vn = to_nhd(q), to_nhd(k), to_nhd(v)
+        indptr = torch.arange(0, (b + 1) * n, n, device="cuda", dtype=torch.int32)
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_FLASHINFER_WORKSPACE, "NHD")
+        wrapper.plan(indptr, indptr, h, h, d, causal=causal, q_data_type=torch.half,
+                     use_fp16_qk_reduction=fp16_qk)
+        return (lambda: wrapper.run(qn, kn, vn)), (lambda o: o.reshape(b, n, h, d).transpose(1, 2))
+
+    return setup
 
 
 IMPLS = {
@@ -46,8 +97,12 @@ IMPLS = {
     "sdpa-flash (FA2)": _sdpa(SDPBackend.FLASH_ATTENTION),
     "sdpa-cudnn": _sdpa(SDPBackend.CUDNN_ATTENTION),
     "sdpa-efficient": _sdpa(SDPBackend.EFFICIENT_ATTENTION),
-    "torch naive": attention_naive_fp16,
+    "torch naive": _simple(attention_naive_fp16),
 }
+if flashinfer is not None:
+    # use_fp16_qk_reduction=True would be FlashInfer's fp16-accumulation mode, but its JIT build
+    # rejects it unless compiled with -DFP16_QK_REDUCTION_SUPPORTED and Boost.Math.
+    IMPLS["flashinfer"] = _flashinfer(fp16_qk=False)
 
 
 def time_ms(fn, warmup=10, min_iters=20, max_iters=200, budget_ms=1500.0):
@@ -65,16 +120,18 @@ def time_ms(fn, warmup=10, min_iters=20, max_iters=200, budget_ms=1500.0):
     return statistics.median(times)
 
 
-def bench_one(name, fn, b, h, n, d, causal, ref_out):
+def bench_one(setup, b, h, n, d, causal, ref_out):
     gen = torch.Generator(device="cuda").manual_seed(0)
     q, k, v = (torch.randn(b, h, n, d, device="cuda", dtype=torch.half, generator=gen) for _ in range(3))
     try:
-        out = fn(q, k, v, causal)
+        run, to_bhnd = setup(q, k, v, causal)
+        out = to_bhnd(run())
         if ref_out is not None:
             err = (out.float() - ref_out.float()).abs().max().item()
             if not err < 2e-2:
                 return {"status": f"mismatch {err:.1e}"}
-        ms = time_ms(lambda: fn(q, k, v, causal))
+        del out
+        ms = time_ms(run)
     except torch.OutOfMemoryError:
         return {"status": "OOM"}
     except RuntimeError as e:  # backend not available for this GPU / shape
@@ -116,14 +173,14 @@ def main():
                 del q, k, v
                 line = [f"d={d:3d} causal={int(causal)} N={n:5d} B={b:2d} H={h:2d} |"]
                 for name in args.impl:
-                    r = bench_one(name, IMPLS[name], b, h, n, d, causal, ref_out)
+                    r = bench_one(IMPLS[name], b, h, n, d, causal, ref_out)
                     rows.append(
                         {"gpu": gpu, "impl": name, "B": b, "H": h, "N": n, "d": d,
                          "causal": int(causal), "ms": r.get("ms", math.nan),
                          "tflops": r.get("tflops", math.nan), "status": r["status"]}
                     )
                     cell = f"{r['tflops']:6.1f}" if r["status"] == "ok" else f"{r['status'][:6]:>6}"
-                    line.append(f"{name.split()[0]} {cell}")
+                    line.append(f"{name.replace(' (ours)', '')}: {cell.strip()}")
                 del ref_out
                 torch.cuda.empty_cache()
                 print("  ".join(line), flush=True)

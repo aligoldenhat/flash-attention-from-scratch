@@ -11,6 +11,8 @@ dependencies = ["torch"]
 
 [project.optional-dependencies]
 dev = ["pytest", "numpy", "pandas", "matplotlib", "ninja"]
+# extra benchmark baselines (FlashInfer compiles its kernels with nvcc on first use)
+bench = ["flashinfer-python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

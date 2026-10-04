@@ -26,16 +26,17 @@ o = fa.forward(q, k, v, causal=True, fp16_accum=True)   # faster on GeForce GPUs
 
 Against PyTorch SDPA's FlashAttention-2 backend, at all 24 benchmarked shapes:
 
-- **fp16-acc: 1.25–1.43x FA2**, up to 19.5 TFLOPS.
-- **opt (exact, fp32 accumulate): 1.02–1.13x FA2**, 14.5–14.8 TFLOPS at large N. That equals a
-  cuBLAS fp16 GEMM on this GPU (14.5 TFLOPS), the fp32-accumulate ceiling.
+- **fp16-acc: 1.21–1.45x FA2**, up to 19.5 TFLOPS.
+- **opt (exact, fp32 accumulate): 1.01–1.16x FA2**, up to 14.8 TFLOPS. That equals a cuBLAS fp16
+  GEMM on this GPU (14.5 TFLOPS), the fp32-accumulate ceiling.
+- Also ahead of cuDNN and FlashInfer (the attention library behind vLLM / SGLang) at every shape.
 
 Full table, method and caveats are in [docs/benchmarking.md](docs/benchmarking.md).
 
-| d=128, N=16k | ours fp16-acc | ours opt | FA2 (SDPA flash) | cuDNN | mem-efficient | naive torch |
-|---|---|---|---|---|---|---|
-| non-causal | **17.9** | **14.6** | 14.2 | 13.7 | 9.3 | OOM |
-| causal | **17.9** | **14.1** | 12.5 | 13.0 | 8.8 | OOM |
+| d=128, N=16k | ours fp16-acc | ours opt | FA2 (SDPA flash) | cuDNN | FlashInfer | mem-efficient | naive torch |
+|---|---|---|---|---|---|---|---|
+| non-causal | **15.9** | **13.2** | 12.9 | 12.7 | 13.0 | 8.5 | OOM |
+| causal | **15.9** | **12.7** | 11.0 | 11.2 | 12.0 | 7.8 | OOM |
 
 FlashAttention-3/4 need Hopper/datacenter-Blackwell hardware and don't run on consumer GPUs, so
 FA2 is the bar here; which of their ideas carry over, and what each one measured, is in

@@ -124,6 +124,19 @@ fp16-accumulate mma layout, both exp2 implementations, all-equal scores and larg
 overflow cases); all sanitizers clean on all variants; 0 register spills in all 12 kernels.
 Details: [fa3_fa4_techniques.md](fa3_fa4_techniques.md), [benchmarking.md](benchmarking.md).
 
+## 10. More production baselines
+
+Checked which attention libraries install against torch 2.14 + CUDA 13. **FlashInfer** (vLLM /
+SGLang's attention library) works: kernels JIT-compiled by the local nvcc, benchmarked on its
+native `[B·N, H, d]` layout. The benchmark now has a per-implementation setup step outside the
+timed region for layout conversion and planning. **xFormers**' wheel is built for torch 2.10, so
+its own kernels don't load and its remaining paths are PyTorch's (duplicates of sdpa lines): not
+added. FlashInfer's fp16 accumulation mode needs a custom build (Boost.Math + a compile flag):
+not added. The official `flash-attn` needs an hours-long source build: deferred to the rented GPUs.
+
+Result: FlashInfer lands next to FA2; ours stays ahead of every library at all 24 shapes
+(fp16acc 1.21–1.45x FA2, opt 1.01–1.16x FA2 in this run).
+
 ## Open items
 
 - **ncu reports**: need sudo; run `make profile` in your own terminal.

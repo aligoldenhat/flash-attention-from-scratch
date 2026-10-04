@@ -26,6 +26,7 @@ STYLE = {
     OURS_BASE: dict(color="salmon", marker="o", linestyle="--"),
     FA2: dict(color="tab:blue", marker="s"),
     "sdpa-cudnn": dict(color="tab:green", marker="^"),
+    "flashinfer": dict(color="tab:orange", marker="D"),
     "sdpa-efficient": dict(color="tab:purple", marker="v"),
     "torch naive": dict(color="tab:gray", marker="x"),
 }

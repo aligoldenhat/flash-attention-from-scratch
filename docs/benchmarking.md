@@ -10,6 +10,7 @@
 | **sdpa-flash (FA2)** | `F.scaled_dot_product_attention` forced to the flash backend: FlashAttention-2 code vendored inside PyTorch. The production bar on these GPUs. |
 | sdpa-cudnn | the same API on NVIDIA's cuDNN fused-attention backend |
 | sdpa-efficient | the memory-efficient backend (xFormers / CUTLASS based) |
+| flashinfer | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) batch prefill, the attention library used by vLLM and SGLang, on its native token-major layout `[B·N, H, d]`. Its kernels are JIT-compiled with the local nvcc on first use. |
 | torch naive | `softmax(Q Kᵀ / √d) V` written with plain matmuls in fp16, materialising N × N |
 
 Not compared, and why:
@@ -21,6 +22,15 @@ Not compared, and why:
 - **The official `flash-attn` package** (Dao-AILab): no prebuilt wheel for this torch/CUDA combo,
   and a source build takes hours. SDPA's flash backend is the same FA2 algorithm and kernel
   family; the package can be added on the rented GPUs.
+- **xFormers** (0.0.35): its wheel is built for torch 2.10 + CUDA 12.8, so with torch 2.14 its own
+  CUDA kernels don't load. The attention paths it still offers (`cutlassF-pt`, `fa2F-pt`) call
+  PyTorch's built-in kernels, the same ones as `sdpa-efficient` and `sdpa-flash`, so it would only
+  add duplicate lines. Needs a source build to test its real kernels.
+- **FlashInfer's fp16 accumulation** (`use_fp16_qk_reduction=True`): its JIT build rejects it unless
+  compiled with `-DFP16_QK_REDUCTION_SUPPORTED` and Boost.Math, so only the default (fp32) mode
+  is benchmarked.
+- **SageAttention** (quantized INT8/fp8 attention): v1 is Triton-based (Triton baselines are on
+  hold), v2 needs a source build. A different accuracy contract; a candidate for later.
 
 ## Method (`bench/benchmark.py`)
 
@@ -31,6 +41,8 @@ Not compared, and why:
 - **FLOPs** = 4·B·H·N²·d (two matmuls of 2·N²·d each), halved for causal.
 - **Correctness cross-check**: before timing, every implementation's output is compared with
   ours on the same inputs; a mismatch above 2e-2 is reported instead of a time.
+- **Native layouts**: each implementation has a setup step outside the timed region (layout
+  conversion, FlashInfer's `plan()`), so each is timed on its preferred input layout.
 - Out-of-memory and unsupported backends are recorded as such, not as crashes.
 
 ```
@@ -42,49 +54,54 @@ python bench/benchmark.py --n 4096 --d 128 --causal 1 --impl "fa (ours)" "sdpa-f
 
 ![benchmark](img/NVIDIA_GeForce_RTX_3050_Laptop_GPU.png)
 
-TFLOPS, higher is better. torch 2.14.1+cu130, CUDA 13.1, driver clocks uncontrolled (laptop).
+TFLOPS, higher is better. torch 2.14.1+cu130, CUDA 13.1, FlashInfer 0.7.0, driver clocks
+uncontrolled (laptop). All columns come from the same run.
 
-| d | causal | N | fa fp16-acc (ours) | fa opt (ours) | fa baseline (ours) | sdpa-flash (FA2) | sdpa-cudnn | sdpa-efficient | torch naive | opt / FA2 | fp16-acc / FA2 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 64 | 0 | 512 | **17.5** | **13.8** | 14.1 | 13.6 | 13.0 | 10.4 | 3.5 | 1.02x | 1.29x |
-| 64 | 0 | 1024 | **18.2** | **14.4** | 14.5 | 14.0 | 13.5 | 10.8 | 3.6 | 1.03x | 1.30x |
-| 64 | 0 | 2048 | **19.2** | **14.6** | 14.8 | 14.2 | 13.8 | 11.0 | OOM | 1.02x | 1.35x |
-| 64 | 0 | 4096 | **19.5** | **14.8** | 14.8 | 14.3 | 14.0 | 11.1 | OOM | 1.04x | 1.37x |
-| 64 | 0 | 8192 | **19.4** | **14.8** | 14.8 | 14.2 | 14.0 | 11.0 | OOM | 1.04x | 1.37x |
-| 64 | 0 | 16384 | **19.4** | **14.8** | 14.8 | 13.9 | 14.0 | 10.8 | OOM | 1.07x | 1.40x |
-| 64 | 1 | 512 | **13.3** | **10.6** | 10.7 | 9.9 | 8.1 | 8.8 | 1.3 | 1.07x | 1.33x |
-| 64 | 1 | 1024 | **15.6** | **12.4** | 12.4 | 11.7 | 10.1 | 9.8 | 1.3 | 1.06x | 1.33x |
-| 64 | 1 | 2048 | **17.1** | **13.5** | 13.4 | 12.7 | 11.5 | 10.3 | OOM | 1.06x | 1.34x |
-| 64 | 1 | 4096 | **17.9** | **14.0** | 14.1 | 13.3 | 12.3 | 10.7 | OOM | 1.06x | 1.35x |
-| 64 | 1 | 8192 | **18.5** | **14.4** | 14.4 | 13.5 | 12.8 | 10.6 | OOM | 1.07x | 1.37x |
-| 64 | 1 | 16384 | **18.7** | **14.5** | 14.5 | 13.3 | 13.0 | 10.2 | OOM | 1.09x | 1.40x |
-| 128 | 0 | 512 | **16.6** | **13.9** | 13.6 | 13.3 | 12.6 | 8.6 | 5.9 | 1.04x | 1.25x |
-| 128 | 0 | 1024 | **17.5** | **14.3** | 14.0 | 13.9 | 13.5 | 9.0 | 5.9 | 1.03x | 1.25x |
-| 128 | 0 | 2048 | **17.9** | **14.5** | 14.2 | 14.1 | 13.8 | 9.1 | 5.9 | 1.03x | 1.27x |
-| 128 | 0 | 4096 | **18.0** | **14.5** | 14.3 | 14.2 | 13.9 | 9.2 | OOM | 1.02x | 1.27x |
-| 128 | 0 | 8192 | **18.1** | **14.6** | 14.3 | 14.2 | 13.9 | 9.2 | OOM | 1.03x | 1.27x |
-| 128 | 0 | 16384 | **17.9** | **14.6** | 14.3 | 14.2 | 13.7 | 9.3 | OOM | 1.03x | 1.26x |
-| 128 | 1 | 512 | **13.7** | **11.4** | 11.2 | 10.9 | 9.4 | 6.8 | 2.3 | 1.04x | 1.26x |
-| 128 | 1 | 1024 | **15.6** | **12.6** | 12.5 | 12.2 | 11.3 | 7.9 | 2.2 | 1.03x | 1.27x |
-| 128 | 1 | 2048 | **16.8** | **13.4** | 13.2 | 12.8 | 12.5 | 8.6 | 2.2 | 1.05x | 1.31x |
-| 128 | 1 | 4096 | **17.5** | **13.9** | 13.7 | 13.1 | 13.3 | 8.8 | OOM | 1.06x | 1.34x |
-| 128 | 1 | 8192 | **17.4** | **14.1** | 13.9 | 12.9 | 13.2 | 8.7 | OOM | 1.09x | 1.35x |
-| 128 | 1 | 16384 | **17.9** | **14.1** | 13.9 | 12.5 | 13.0 | 8.8 | OOM | 1.13x | 1.43x |
+| d | causal | N | fa fp16-acc (ours) | fa opt (ours) | fa baseline (ours) | sdpa-flash (FA2) | sdpa-cudnn | flashinfer | sdpa-efficient | torch naive | opt / FA2 | fp16-acc / FA2 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 0 | 512 | **18.1** | **14.2** | 14.2 | 13.4 | 12.9 | 13.3 | 10.5 | 3.5 | 1.06x | 1.35x |
+| 64 | 0 | 1024 | **18.7** | **14.4** | 14.5 | 14.0 | 13.4 | 13.5 | 10.8 | 3.6 | 1.03x | 1.34x |
+| 64 | 0 | 2048 | **19.0** | **14.7** | 14.6 | 14.1 | 13.7 | 13.8 | 10.9 | OOM | 1.04x | 1.35x |
+| 64 | 0 | 4096 | **19.2** | **14.7** | 14.7 | 14.1 | 13.8 | 13.7 | 11.0 | OOM | 1.04x | 1.36x |
+| 64 | 0 | 8192 | **19.1** | **14.6** | 14.6 | 14.1 | 13.9 | 13.8 | 10.9 | OOM | 1.04x | 1.36x |
+| 64 | 0 | 16384 | **19.2** | **14.7** | 14.6 | 13.7 | 13.8 | 13.6 | 10.6 | OOM | 1.07x | 1.40x |
+| 64 | 1 | 512 | **13.0** | **10.4** | 10.5 | 9.8 | 7.9 | 9.8 | 8.7 | 1.3 | 1.07x | 1.33x |
+| 64 | 1 | 1024 | **15.3** | **12.1** | 12.2 | 11.5 | 9.9 | 11.4 | 9.6 | 1.3 | 1.06x | 1.33x |
+| 64 | 1 | 2048 | **16.8** | **13.2** | 13.2 | 12.5 | 11.4 | 12.2 | 10.2 | OOM | 1.06x | 1.34x |
+| 64 | 1 | 4096 | **17.4** | **13.7** | 13.7 | 12.9 | 12.1 | 12.9 | 10.3 | OOM | 1.07x | 1.35x |
+| 64 | 1 | 8192 | **17.7** | **13.9** | 13.8 | 13.1 | 12.5 | 12.8 | 10.0 | OOM | 1.06x | 1.35x |
+| 64 | 1 | 16384 | **17.8** | **13.7** | 13.7 | 13.0 | 12.3 | 12.7 | 9.4 | OOM | 1.06x | 1.38x |
+| 128 | 0 | 512 | **15.6** | **13.1** | 12.9 | 12.9 | 12.1 | 12.9 | 8.2 | 5.6 | 1.02x | 1.21x |
+| 128 | 0 | 1024 | **16.1** | **13.4** | 13.2 | 13.1 | 12.6 | 12.9 | 8.4 | 5.7 | 1.02x | 1.23x |
+| 128 | 0 | 2048 | **16.6** | **13.7** | 13.1 | 13.0 | 12.7 | 13.3 | 8.6 | 5.6 | 1.05x | 1.28x |
+| 128 | 0 | 4096 | **16.6** | **13.6** | 13.3 | 13.2 | 13.0 | 13.3 | 8.6 | OOM | 1.03x | 1.26x |
+| 128 | 0 | 8192 | **16.4** | **13.5** | 13.3 | 13.1 | 12.6 | 13.0 | 8.4 | OOM | 1.03x | 1.25x |
+| 128 | 0 | 16384 | **15.9** | **13.2** | 13.0 | 12.9 | 12.7 | 13.0 | 8.5 | OOM | 1.03x | 1.24x |
+| 128 | 1 | 512 | **11.9** | **9.9** | 9.9 | 9.8 | 8.4 | 9.2 | 6.2 | 2.2 | 1.01x | 1.22x |
+| 128 | 1 | 1024 | **13.9** | **11.3** | 11.2 | 11.1 | 10.2 | 10.7 | 7.1 | 2.1 | 1.02x | 1.25x |
+| 128 | 1 | 2048 | **14.6** | **12.2** | 11.9 | 11.2 | 11.3 | 11.6 | 7.7 | 2.0 | 1.08x | 1.30x |
+| 128 | 1 | 4096 | **15.1** | **12.6** | 12.4 | 11.7 | 11.7 | 11.9 | 7.8 | OOM | 1.08x | 1.30x |
+| 128 | 1 | 8192 | **15.8** | **12.7** | 12.1 | 11.0 | 11.6 | 12.0 | 7.8 | OOM | 1.15x | 1.43x |
+| 128 | 1 | 16384 | **15.9** | **12.7** | 12.5 | 11.0 | 11.2 | 12.0 | 7.8 | OOM | 1.16x | 1.45x |
 
 ### How to read these numbers honestly
 
 - **The fp32-accumulate ceiling is about 14.5 TFLOPS.** A plain cuBLAS fp16 GEMM (4096³, fp32
   accumulate) measures 14.5 TFLOPS on this laptop. `opt` and `baseline` reach 14.5–14.8:
   attention runs at the speed of a pure matmul, and every fp32-accumulate implementation is
-  squeezed against the same hardware limit. That's why opt / FA2 is only 1.02–1.13x, and why
+  squeezed against the same hardware limit. That's why opt / FA2 is only 1.01–1.16x, and why
   opt and baseline overlap.
-- **fp16-acc breaks that ceiling: 1.25–1.43x FA2** (up to 19.5 TFLOPS). GeForce GPUs run
+- **FlashInfer** lands next to FA2: about equal at d = 64, slightly ahead of FA2 at d = 128 causal,
+  behind ours everywhere.
+- **fp16-acc breaks that ceiling: 1.21–1.45x FA2** (up to 19.5 TFLOPS in a cool run). GeForce GPUs run
   fp16-accumulate tensor-core math at twice the fp32-accumulate rate; the P·V half of the work
   uses it. See [fa3_fa4_techniques.md](fa3_fa4_techniques.md) for how it stays accurate.
 - Biggest exact-path wins are **causal** (6–13% over FA2): diagonal-only masking, skipping
   fully masked tiles, reversed block order for load balance, and causal-specific tile shapes.
 - **Laptop noise**: clocks move with temperature and power, about ±0.3 TFLOPS run to run at
-  large N and more at N = 512. Differences under ~2% are within noise.
+  large N and more at N = 512. Differences under ~2% are within noise. Whole runs shift too: in
+  this run every implementation measured 5–10% lower at d = 128 than in the previous one (FA2
+  included), so compare columns within one run, not numbers across runs.
 - **naive OOM**: the fp16 N × N score matrix needs 2–8 GB at these shapes, more than the 4 GB card.
 - The rented RTX 4090 / 5090 have far more tensor throughput per byte of shared-memory and
   DRAM bandwidth, so the gap between implementations there will be larger and more telling.
@@ -129,7 +146,7 @@ What the sweep showed:
 
 ```
 git clone ... && cd flash-attention-from-scratch
-uv venv --python 3.12 .venv && uv pip install --python .venv torch numpy pytest pandas matplotlib ninja setuptools \
+uv venv --python 3.12 .venv && uv pip install --python .venv torch numpy pytest pandas matplotlib ninja setuptools flashinfer-python \
     --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
 make build ARCH=8.9          # RTX 4090 (12.0 for RTX 5090)
 make test                    # correctness first
