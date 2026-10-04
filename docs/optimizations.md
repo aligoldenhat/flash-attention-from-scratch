@@ -154,11 +154,33 @@ rows of the Q shared-memory tile with the same swizzle, and copied to global mem
 tuning table in [benchmarking.md](benchmarking.md#tile-tuning-benchtunesh-make-tune). On a new GPU, re-run `make tune` and update the four `using
 ConfigD...` lines at the bottom of the kernel file.
 
+## 13. Beyond FA2: variants and optional features
+
+The kernel template takes an `Opt` set of compile-time features (numbered 12–17 in the
+kernel's header comment) and is built in three variants:
+
+| Variant | API | Features | Purpose |
+|---|---|---|---|
+| `baseline` | `fa.forward_variant(..., variant="baseline")` | none | the first tuned FA2 kernel, kept as the reference point |
+| `opt` | `fa.forward(...)` (default) | LAZY (FA4 conditional rescale) | exact fp32 accumulation |
+| `fp16acc` | `fa.forward(..., fp16_accum=True)` | ACC16 + EXP16, STAGES=2 at d = 64 | P·V accumulated in fp16 per tile: 2× tensor rate on GeForce GPUs |
+
+How ACC16 stays accurate: the P·V partial sum for one key tile is computed with
+`mma.sync...f16.f16.f16.f16` (fp16 accumulate), then converted and added into the fp32 O
+accumulator, which also carries the online-softmax rescaling. Only BC/16 fp16 roundings
+happen per tile, P ≤ 1 bounds every partial sum, and nothing accumulates in fp16 across tiles,
+so a long sequence can't overflow. Its loop runs head-dim slices outside and keys inside, so
+only a few fp16 partial registers are alive at once.
+
+Every feature was measured on its own with `bench/ablate.sh`. FA3/FA4 techniques, which ones
+apply to consumer GPUs, the ablation tables and the number-format background are in
+[fa3_fa4_techniques.md](fa3_fa4_techniques.md).
+
 ## What is *not* here (and why)
 
 - **FlashAttention-3** techniques (TMA, WGMMA, warp specialisation, ping-pong scheduling)
   need Hopper (sm_90) hardware; RTX 3050/4090/5090 don't have it.
-- **FP8** (Ada sm_89+ supports fp8 mma): different accuracy contract; a possible extension.
+- **FP8** (Ada sm_89+ supports fp8 mma): different accuracy contract and can't run on the 3050; see [fa3_fa4_techniques.md](fa3_fa4_techniques.md).
 - **Split-KV (Flash-Decoding)** for tiny batch × long KV: this kernel targets prefill/training
   shapes where B·H·N/BR already fills the GPU.
 - Backward pass.

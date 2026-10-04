@@ -86,8 +86,8 @@ All tests pass under memcheck, racecheck, synccheck and initcheck. Details: [tes
 
 | Check | Result |
 |---|---|
-| pytest | 57 passed |
-| GoogleTest (ctest) | 19 passed |
+| pytest | 57 passed (159 after section 9) |
+| GoogleTest (ctest) | 19 passed (40 after section 9) |
 | `make sanitize` | 0 errors / 0 hazards (driver, GoogleTest, pytest subsets) |
 | Register spills | 0 in all four configs |
 | Benchmark vs FA2 (RTX 3050) | faster at all 24 shapes |
@@ -102,7 +102,33 @@ strips `--use_fast_math`; `bindings.cpp` gets its own flags with the PyTorch hea
 `std::numbers::log2e_v` and has two documented NOLINTs; everything is clang-formatted.
 Result: 0 clangd diagnostics and 0 clang-tidy warnings in all files. See [setup.md](setup.md#editor-setup-clangd).
 
+## 9. FA3/FA4 techniques, fp16 accumulation, ablation
+
+Reviewed FA3 (Hopper) and FA4 (datacenter Blackwell) for ideas that work without their
+hardware (WGMMA, TMA, tcgen05/TMEM don't exist on RTX 3050/4090/5090). The kernel template got
+an `Opt` set of compile-time features: PEEL (masked tiles in their own loop), LAZY (FA4
+conditional rescaling), EXP16 (`ex2.approx.f16x2`), EMU (FA4 polynomial exp2 on the FMA pipe),
+ACC16 (P·V accumulated in fp16 per tile, folded into fp32), plus STAGES (double-buffered K/V)
+in the tile config. Three builds: `baseline` (the previous kernel), `opt` (default, exact),
+`fp16acc` (opt-in, `fp16_accum=True`).
+
+`bench/ablate.sh` measured each feature alone. On the fp32-accumulate path nothing helps
+measurably: it's at the 14.5 TFLOPS tensor-core ceiling. **fp16 accumulation is the one big win
+(+25–30%)**, because GeForce tensor cores run it at twice the rate. STAGES=2 helps only at
+d = 64 (at d = 128 it halves occupancy), so it moved into the per-tile config; FA4's software
+exp2 and peeling made things slower here. fp16acc tiles were re-tuned with `bench/tune.sh`.
+
+Result (RTX 3050): **fp16acc 1.25–1.43x FA2** (up to 19.5 TFLOPS), **opt 1.02–1.13x FA2**, at
+all 24 shapes. Tests extended to every variant (pytest 159, GoogleTest 40, including the
+fp16-accumulate mma layout, both exp2 implementations, all-equal scores and large-|V|
+overflow cases); all sanitizers clean on all variants; 0 register spills in all 12 kernels.
+Details: [fa3_fa4_techniques.md](fa3_fa4_techniques.md), [benchmarking.md](benchmarking.md).
+
 ## Open items
 
 - **ncu reports**: need sudo; run `make profile` in your own terminal.
-- Benchmarks on RTX 4090 / 5090 (re-tune first), optionally with the official `flash-attn` package.
+- Benchmarks on RTX 4090 / 5090 (re-tune and re-ablate first), optionally with the official
+  `flash-attn` package. Re-check EMU (software exp2) there: faster tensor cores may make the SFU
+  the bottleneck, which is exactly when FA4 needs it.
+- FP8 attention on the 4090/5090 (not possible on the 3050).
+- Runtime tile selection by sequence length; persistent kernel with a tile scheduler.

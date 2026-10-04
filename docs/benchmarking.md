@@ -4,7 +4,9 @@
 
 | Name in the results | What it is |
 |---|---|
-| **fa (ours)** | this repo's kernel, `fa.forward` |
+| **fa fp16-acc (ours)** | this repo's kernel, `fa.forward(..., fp16_accum=True)`: P·V accumulated in fp16 per tile (opt-in) |
+| **fa opt (ours)** | this repo's kernel, `fa.forward` (default): exact fp32 accumulation |
+| fa baseline (ours) | the first tuned version of the kernel, kept as the reference point |
 | **sdpa-flash (FA2)** | `F.scaled_dot_product_attention` forced to the flash backend: FlashAttention-2 code vendored inside PyTorch. The production bar on these GPUs. |
 | sdpa-cudnn | the same API on NVIDIA's cuDNN fused-attention backend |
 | sdpa-efficient | the memory-efficient backend (xFormers / CUTLASS based) |
@@ -42,47 +44,51 @@ python bench/benchmark.py --n 4096 --d 128 --causal 1 --impl "fa (ours)" "sdpa-f
 
 TFLOPS, higher is better. torch 2.14.1+cu130, CUDA 13.1, driver clocks uncontrolled (laptop).
 
-| d | causal | N | **fa (ours)** | sdpa-flash (FA2) | sdpa-cudnn | sdpa-efficient | torch naive | ours / FA2 |
-|---|---|---|---|---|---|---|---|---|
-| 64 | 0 | 512 | **14.4** | 13.7 | 13.2 | 10.7 | 3.5 | 1.05x |
-| 64 | 0 | 1024 | **14.6** | 14.3 | 13.7 | 11.1 | 3.7 | 1.03x |
-| 64 | 0 | 2048 | **14.8** | 14.5 | 14.0 | 11.2 | OOM | 1.02x |
-| 64 | 0 | 4096 | **14.8** | 14.4 | 14.0 | 11.2 | OOM | 1.02x |
-| 64 | 0 | 8192 | **14.8** | 14.4 | 14.1 | 11.2 | OOM | 1.03x |
-| 64 | 0 | 16384 | **14.8** | 14.0 | 14.1 | 10.9 | OOM | 1.06x |
-| 64 | 1 | 512 | **10.9** | 10.1 | 8.2 | 8.9 | 1.3 | 1.08x |
-| 64 | 1 | 1024 | **12.6** | 11.8 | 10.2 | 9.9 | 1.3 | 1.06x |
-| 64 | 1 | 2048 | **13.6** | 12.5 | 11.4 | 10.5 | OOM | 1.09x |
-| 64 | 1 | 4096 | **14.2** | 13.4 | 12.4 | 10.9 | OOM | 1.06x |
-| 64 | 1 | 8192 | **14.6** | 13.6 | 12.9 | 10.2 | OOM | 1.07x |
-| 64 | 1 | 16384 | **14.7** | 13.7 | 13.2 | 10.4 | OOM | 1.08x |
-| 128 | 0 | 512 | **13.9** | 13.8 | 13.0 | 8.7 | 5.9 | 1.01x |
-| 128 | 0 | 1024 | **14.3** | 14.1 | 13.7 | 9.0 | 6.0 | 1.01x |
-| 128 | 0 | 2048 | **14.4** | 14.2 | 13.9 | 9.1 | 5.9 | 1.01x |
-| 128 | 0 | 4096 | **14.5** | 14.3 | 14.0 | 9.2 | OOM | 1.02x |
-| 128 | 0 | 8192 | **14.5** | 14.3 | 13.9 | 9.3 | OOM | 1.02x |
-| 128 | 0 | 16384 | **14.5** | 14.3 | 13.7 | 9.3 | OOM | 1.02x |
-| 128 | 1 | 512 | **11.4** | 11.2 | 9.6 | 6.9 | 2.3 | 1.02x |
-| 128 | 1 | 1024 | **12.6** | 12.4 | 11.4 | 8.0 | 2.2 | 1.02x |
-| 128 | 1 | 2048 | **13.3** | 13.0 | 12.6 | 8.6 | 2.2 | 1.03x |
-| 128 | 1 | 4096 | **13.8** | 13.2 | 13.4 | 8.9 | OOM | 1.04x |
-| 128 | 1 | 8192 | **13.9** | 13.0 | 13.3 | 8.9 | OOM | 1.07x |
-| 128 | 1 | 16384 | **14.0** | 12.7 | 13.3 | 8.9 | OOM | 1.11x |
+| d | causal | N | fa fp16-acc (ours) | fa opt (ours) | fa baseline (ours) | sdpa-flash (FA2) | sdpa-cudnn | sdpa-efficient | torch naive | opt / FA2 | fp16-acc / FA2 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 0 | 512 | **17.5** | **13.8** | 14.1 | 13.6 | 13.0 | 10.4 | 3.5 | 1.02x | 1.29x |
+| 64 | 0 | 1024 | **18.2** | **14.4** | 14.5 | 14.0 | 13.5 | 10.8 | 3.6 | 1.03x | 1.30x |
+| 64 | 0 | 2048 | **19.2** | **14.6** | 14.8 | 14.2 | 13.8 | 11.0 | OOM | 1.02x | 1.35x |
+| 64 | 0 | 4096 | **19.5** | **14.8** | 14.8 | 14.3 | 14.0 | 11.1 | OOM | 1.04x | 1.37x |
+| 64 | 0 | 8192 | **19.4** | **14.8** | 14.8 | 14.2 | 14.0 | 11.0 | OOM | 1.04x | 1.37x |
+| 64 | 0 | 16384 | **19.4** | **14.8** | 14.8 | 13.9 | 14.0 | 10.8 | OOM | 1.07x | 1.40x |
+| 64 | 1 | 512 | **13.3** | **10.6** | 10.7 | 9.9 | 8.1 | 8.8 | 1.3 | 1.07x | 1.33x |
+| 64 | 1 | 1024 | **15.6** | **12.4** | 12.4 | 11.7 | 10.1 | 9.8 | 1.3 | 1.06x | 1.33x |
+| 64 | 1 | 2048 | **17.1** | **13.5** | 13.4 | 12.7 | 11.5 | 10.3 | OOM | 1.06x | 1.34x |
+| 64 | 1 | 4096 | **17.9** | **14.0** | 14.1 | 13.3 | 12.3 | 10.7 | OOM | 1.06x | 1.35x |
+| 64 | 1 | 8192 | **18.5** | **14.4** | 14.4 | 13.5 | 12.8 | 10.6 | OOM | 1.07x | 1.37x |
+| 64 | 1 | 16384 | **18.7** | **14.5** | 14.5 | 13.3 | 13.0 | 10.2 | OOM | 1.09x | 1.40x |
+| 128 | 0 | 512 | **16.6** | **13.9** | 13.6 | 13.3 | 12.6 | 8.6 | 5.9 | 1.04x | 1.25x |
+| 128 | 0 | 1024 | **17.5** | **14.3** | 14.0 | 13.9 | 13.5 | 9.0 | 5.9 | 1.03x | 1.25x |
+| 128 | 0 | 2048 | **17.9** | **14.5** | 14.2 | 14.1 | 13.8 | 9.1 | 5.9 | 1.03x | 1.27x |
+| 128 | 0 | 4096 | **18.0** | **14.5** | 14.3 | 14.2 | 13.9 | 9.2 | OOM | 1.02x | 1.27x |
+| 128 | 0 | 8192 | **18.1** | **14.6** | 14.3 | 14.2 | 13.9 | 9.2 | OOM | 1.03x | 1.27x |
+| 128 | 0 | 16384 | **17.9** | **14.6** | 14.3 | 14.2 | 13.7 | 9.3 | OOM | 1.03x | 1.26x |
+| 128 | 1 | 512 | **13.7** | **11.4** | 11.2 | 10.9 | 9.4 | 6.8 | 2.3 | 1.04x | 1.26x |
+| 128 | 1 | 1024 | **15.6** | **12.6** | 12.5 | 12.2 | 11.3 | 7.9 | 2.2 | 1.03x | 1.27x |
+| 128 | 1 | 2048 | **16.8** | **13.4** | 13.2 | 12.8 | 12.5 | 8.6 | 2.2 | 1.05x | 1.31x |
+| 128 | 1 | 4096 | **17.5** | **13.9** | 13.7 | 13.1 | 13.3 | 8.8 | OOM | 1.06x | 1.34x |
+| 128 | 1 | 8192 | **17.4** | **14.1** | 13.9 | 12.9 | 13.2 | 8.7 | OOM | 1.09x | 1.35x |
+| 128 | 1 | 16384 | **17.9** | **14.1** | 13.9 | 12.5 | 13.0 | 8.8 | OOM | 1.13x | 1.43x |
 
 ### How to read these numbers honestly
 
-- **This GPU's ceiling is about 14.5 TFLOPS.** A plain cuBLAS fp16 GEMM (4096³, fp32 accumulate)
-  measures 14.5 TFLOPS on this laptop. Ours reaches 14.5–14.8: attention runs at the speed of a
-  pure matmul, and every implementation is squeezed against the same hardware limit. That is
-  why the margins are small (1–11%).
-- Biggest wins are **causal** (6–11% over FA2): diagonal-only masking, skipping fully masked
-  tiles, reversed block order for load balance, and causal-specific tile shapes.
+- **The fp32-accumulate ceiling is about 14.5 TFLOPS.** A plain cuBLAS fp16 GEMM (4096³, fp32
+  accumulate) measures 14.5 TFLOPS on this laptop. `opt` and `baseline` reach 14.5–14.8:
+  attention runs at the speed of a pure matmul, and every fp32-accumulate implementation is
+  squeezed against the same hardware limit. That's why opt / FA2 is only 1.02–1.13x, and why
+  opt and baseline overlap.
+- **fp16-acc breaks that ceiling: 1.25–1.43x FA2** (up to 19.5 TFLOPS). GeForce GPUs run
+  fp16-accumulate tensor-core math at twice the fp32-accumulate rate; the P·V half of the work
+  uses it. See [fa3_fa4_techniques.md](fa3_fa4_techniques.md) for how it stays accurate.
+- Biggest exact-path wins are **causal** (6–13% over FA2): diagonal-only masking, skipping
+  fully masked tiles, reversed block order for load balance, and causal-specific tile shapes.
 - **Laptop noise**: clocks move with temperature and power, about ±0.3 TFLOPS run to run at
   large N and more at N = 512. Differences under ~2% are within noise.
 - **naive OOM**: the fp16 N × N score matrix needs 2–8 GB at these shapes, more than the 4 GB card.
 - The rented RTX 4090 / 5090 have far more tensor throughput per byte of shared-memory and
   DRAM bandwidth, so the gap between implementations there will be larger and more telling.
-  **Re-run `make tune` first on each new GPU.**
+  **Re-run `make tune` (and `bench/ablate.sh`) first on each new GPU.**
 
 ## Tile tuning (`bench/tune.sh`, `make tune`)
 
@@ -96,6 +102,16 @@ the standalone driver; each run also checks correctness.
 | d = 64 causal | `4, 2, 64, true` | 11.0 / 12.7 / 14.3 / 14.8 | 9.8 / 12.8 / 13.9 / 14.1 |
 | d = 128 | `4, 2, 32, false` | 14.0 / 14.4 / 14.6 / 14.6 | 13.7 / 14.1 / 14.3 / 14.2 |
 | d = 128 causal | `4, 1, 64, true` | 11.6 / 12.9 / 14.0 / 14.2 | (same) |
+
+`fp16acc` tiles (`Config<..., STAGES>` adds the pipeline depth), re-tuned because fp16
+accumulation moves the bottleneck:
+
+| Slot | Chosen | TFLOPS N = 512 / 1k / 4k / 16k |
+|---|---|---|
+| d = 64 | `4, 2, 32, true, 2` | 16.0 / 19.0 / 19.6 / 19.5 |
+| d = 64 causal | `4, 2, 32, true, 2` | 12.1 / 16.0 / 18.5 / 19.1 |
+| d = 128 | `4, 1, 64, true, 1` | 14.8 / 18.1 / 18.5 / 18.4 |
+| d = 128 causal | `4, 1, 64, true, 1` | 12.6 / 16.2 / 18.1 / 18.4 |
 
 What the sweep showed:
 
@@ -117,6 +133,6 @@ uv venv --python 3.12 .venv && uv pip install --python .venv torch numpy pytest 
     --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
 make build ARCH=8.9          # RTX 4090 (12.0 for RTX 5090)
 make test                    # correctness first
-make tune ARCH=8.9           # pick tiles for this GPU, update the 4 `using ConfigD...` lines, rebuild
+make tune                    # pick tiles for this GPU, update the `using <Base|Opt|Fast>D...` lines, rebuild
 make bench                   # -> bench/results/NVIDIA_GeForce_RTX_4090.csv + plot
 ```

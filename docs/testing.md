@@ -4,8 +4,8 @@ Three layers, from the outside in:
 
 | Layer | Tool | Checks | Run |
 |---|---|---|---|
-| End to end | pytest (57 tests) | `fa.forward` vs a float32 PyTorch reference, many shapes | `make test` |
-| Building blocks + C++ API | GoogleTest (19 tests) | mma / ldmatrix layouts, swizzle, cp.async, argument validation, small end-to-end | `make test` |
+| End to end | pytest (159 tests) | all three kernel variants vs a float32 PyTorch reference, many shapes | `make test` |
+| Building blocks + C++ API | GoogleTest (40 tests) | mma (fp32 and fp16 accumulate) / ldmatrix layouts, swizzle, cp.async, exp2 implementations, argument validation, small end-to-end on every variant | `make test` |
 | Memory / races | compute-sanitizer | out-of-bounds, races, barrier misuse, uninitialised reads | `make sanitize` |
 
 ## pytest (`tests/test_flash_fwd.py`)
@@ -24,6 +24,13 @@ measured errors are around 1e-3).
   output must equal V[0]), `test_deterministic` (bitwise equal on repeat).
 - `test_input_validation`, `test_unsupported_head_dim`: wrong dtype / device / layout / shape
   raise errors instead of computing garbage.
+- Variants: `test_matches_reference` and `test_large_logits_are_stable` run on all three builds
+  (`baseline`, `opt`, `fp16acc`). Large logits also exercise lazy rescaling (the row max keeps
+  jumping by more than 2^8).
+- `test_uniform_scores`: q = 0 makes every p = 1, the largest possible per-tile sums, the
+  worst case for fp16acc's fp16 partial sums. Output must equal the mean of V.
+- `test_fp16acc_large_values_no_overflow`: |V| ≈ 100–400 over N = 4096. An fp16 accumulator
+  across the whole sequence would overflow 65504; fp16acc must stay finite and correct.
 
 ## GoogleTest (`tests/cpp/`)
 
@@ -42,13 +49,17 @@ fp16 and fp32), so results are compared for exact equality:
 | `Swizzle.LdmatrixColumnReadsAreBankConflictFree` | the 8 rows of one ldmatrix phase land in 8 different bank groups, and without the swizzle they would all land in one |
 | `Swizzle.RowWritesAreBankConflictFree` | cp.async row writes stay conflict-free |
 | `CpAsync.SrcSizeZeroWritesZeros` | `cp.async` with src-size 0 writes zeros: the padding used for rows ≥ N |
+| `Mma16816.F16AccumulateFragmentLayoutMatchesCpuMatmul` | the fp16-accumulate mma (used by fp16acc) has the C layout the kernel assumes |
+| `Exp2.PolynomialRelativeErrorBelowFp16Resolution` | FA4-style polynomial exp2: worst relative error < 2e-4 over [−30, 8], and −inf → 0 |
+| `Exp2.F16x2MatchesExp2WithinFp16Precision` | `ex2.approx.f16x2` matches exp2 to fp16 precision |
 
 `test_flash_fwd.cu`, the C++ API `fa::flash_fwd`:
 
 - `FlashFwdArgs.*`: head_dim 32, empty shapes and misaligned pointers throw
   `std::invalid_argument` (Python sees `ValueError`).
-- `Shapes/FlashFwdVsCpu.MatchesReference/*`: 9 small shapes against a double-precision CPU
-  reference, so `ctest` alone is a meaningful check on a machine without PyTorch.
+- `Shapes/FlashFwdVsCpu.MatchesReference/*`: 9 small shapes × 3 variants against a
+  double-precision CPU reference, so `ctest` alone is a meaningful check on a machine without
+  PyTorch.
 
 ### Do the tests catch bugs? (mutation check)
 
@@ -83,7 +94,7 @@ kernel and reports bad memory accesses with the exact source line (thanks to `-l
 | `initcheck` | reads of uninitialised global memory |
 
 `make sanitize` runs all four on the standalone driver for six shapes (odd N, both head dims,
-causal on/off, N = 1) and on the GoogleTest binary, then memcheck and racecheck on a pytest
+causal on/off, N = 1) × three variants (72 runs) and on the GoogleTest binary, then memcheck and racecheck on a pytest
 subset (`--kernel-name kns=flash_fwd_kernel` limits checking to our kernel, not PyTorch's).
 Current result: **0 errors, 0 hazards** everywhere.
 

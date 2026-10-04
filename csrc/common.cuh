@@ -97,10 +97,48 @@ __device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4],
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// Same shape, fp16 accumulate: C/D are 2 registers of half2 (d[0]: row g, d[1]: row g+8,
+// columns 2t..2t+1). GeForce GPUs (RTX 30/40/50) run this at twice the rate of the fp32-
+// accumulate version; datacenter GPUs run both at the same rate.
+__device__ __forceinline__ void mma_16816_f16acc(uint32_t (&d)[2], const uint32_t (&a)[4],
+                                                 uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+        : "+r"(d[0]), "+r"(d[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 // Packs two floats into one register holding a half2 (lo in the low 16 bits).
 __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Unpacks a register holding a half2 into two floats.
+__device__ __forceinline__ float2 unpack_half2(uint32_t r) {
+    return __half22float2(*reinterpret_cast<const __half2*>(&r));
+}
+
+// Two 2^x in one SFU (special function unit) instruction, on a packed half2.
+__device__ __forceinline__ uint32_t ex2_f16x2(uint32_t x) {
+    uint32_t y = 0;  // NOLINT(misc-const-correctness): written by the asm statement
+    asm("ex2.approx.f16x2 %0, %1;\n" : "=r"(y) : "r"(x));
+    return y;
+}
+
+// 2^x on the FMA pipe instead of the SFU (the FlashAttention-4 trick): the SFU does only 16
+// exp2 per clock per SM, the FMA units 128 FMAs. 2^x = 2^floor(x) * 2^frac(x), with 2^frac by
+// a degree-3 polynomial (max relative error ~1e-4, below fp16's resolution of 4.9e-4, and P is
+// rounded to fp16 anyway); 2^floor(x) is added straight into the exponent bits.
+__device__ __forceinline__ float exp2_poly3(float x) {
+    x = fmaxf(x, -127.0F);  // 2^-127 underflows to 0; also maps -inf (masked) to 0
+    const float xi = floorf(x);
+    const float f = x - xi;  // in [0, 1)
+    float p = fmaf(f, 0.07944023841053369F, 0.224494337302845F);
+    p = fmaf(p, f, 0.6960656421638072F);
+    p = fmaf(p, f, 1.0F);
+    return __int_as_float(__float_as_int(p) + (static_cast<int>(xi) << 23));
 }
 
 }  // namespace fa::ptx

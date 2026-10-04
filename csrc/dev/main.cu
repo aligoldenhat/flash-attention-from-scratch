@@ -1,7 +1,8 @@
 // Standalone driver for the kernel, without Python: used by compute-sanitizer and ncu
 // (smaller, cleaner traces than a PyTorch process) and by the CMake strict-warning build.
 //
-//   fa_dev [B H N D causal iters]       defaults: 4 8 4096 128 0 20
+//   fa_dev [B H N D causal iters variant]   defaults: 4 8 4096 128 0 20 opt
+//   variant: base | opt | fp16acc
 //
 // Checks a sample of output rows against a double-precision CPU reference, then times
 // `iters` launches with CUDA events.
@@ -17,6 +18,7 @@
 #include <exception>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -60,6 +62,19 @@ std::vector<double> reference_row(const std::vector<half>& q, const std::vector<
     return out;
 }
 
+fa::Variant parse_variant(const std::string& name) {
+    if (name == "base") {
+        return fa::Variant::kBaseline;
+    }
+    if (name == "opt") {
+        return fa::Variant::kOpt;
+    }
+    if (name == "fp16acc") {
+        return fa::Variant::kFp16Acc;
+    }
+    throw std::invalid_argument("variant must be base, opt or fp16acc, got " + name);
+}
+
 int arg_or(int argc, char** argv, int idx, int fallback) {
     return argc > idx ? std::stoi(argv[idx]) : fallback;
 }
@@ -71,6 +86,8 @@ int run(int argc, char** argv) {
     const int d = arg_or(argc, argv, 4, 128);
     const bool causal = arg_or(argc, argv, 5, 0) != 0;
     const int iters = arg_or(argc, argv, 6, 20);
+    const std::string variant_name = argc > 7 ? argv[7] : "opt";
+    const fa::Variant variant = parse_variant(variant_name);
 
     const size_t elems = static_cast<size_t>(batch) * static_cast<size_t>(heads) *
                          static_cast<size_t>(n) * static_cast<size_t>(d);
@@ -110,6 +127,7 @@ int run(int argc, char** argv) {
     p.head_dim = d;
     p.softmax_scale = 1.0F / std::sqrt(static_cast<float>(d));
     p.causal = causal;
+    p.variant = variant;
 
     fa::flash_fwd(p, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -151,8 +169,8 @@ int run(int argc, char** argv) {
     const double flops =
         4.0 * static_cast<double>(elems) * static_cast<double>(n) / (causal ? 2.0 : 1.0);
 
-    std::printf("B=%d H=%d N=%d D=%d causal=%d  max_abs_err=%.2e  median=%.3f ms  %.1f TFLOPS\n",
-                batch, heads, n, d, causal ? 1 : 0, max_err, median_ms,
+    std::printf("%s B=%d H=%d N=%d D=%d causal=%d  max_abs_err=%.2e  median=%.3f ms  %.1f TFLOPS\n",
+                variant_name.c_str(), batch, heads, n, d, causal ? 1 : 0, max_err, median_ms,
                 median_ms > 0.0 ? flops / (median_ms * 1e9) : 0.0);
 
     CUDA_CHECK(cudaEventDestroy(start));

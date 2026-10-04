@@ -36,11 +36,14 @@ dev:
 # that hit every code path: odd N (partial Q and K/V tiles), both head dims, causal on/off,
 # and on the pytest suite filtered to our kernel (catches binding-level mistakes too).
 SAN_SHAPES = "1 2 257 64 0" "1 2 257 64 1" "2 3 200 128 0" "2 3 200 128 1" "1 1 1 64 1" "1 2 1000 128 1"
+SAN_VARIANTS = base opt fp16acc
 sanitize: dev
 	@for tool in memcheck racecheck synccheck initcheck; do \
-	  for shape in $(SAN_SHAPES); do \
-	    echo "== $$tool $$shape"; \
-	    $(SAN) --tool $$tool $(DRIVER) $$shape 1 | tail -n 2 || exit 1; \
+	  for variant in $(SAN_VARIANTS); do \
+	    for shape in $(SAN_SHAPES); do \
+	      echo "== $$tool $$variant $$shape"; \
+	      $(SAN) --tool $$tool $(DRIVER) $$shape 1 $$variant | tail -n 2 || exit 1; \
+	    done; \
 	  done; \
 	  echo "== $$tool fa_tests"; \
 	  $(SAN) --tool $$tool build/release/fa_tests --gtest_brief=1 | tail -n 2 || exit 1; \
@@ -63,7 +66,7 @@ nsys:
 	profile/nsys.sh 4096 128 0
 
 tune:
-	@for slot in "64 0" "64 1" "128 0" "128 1"; do bench/tune.sh $$slot; echo; done
+	@for v in opt fp16acc; do for slot in "64 0" "64 1" "128 0" "128 1"; do bench/tune.sh $$v $$slot; echo; done; done
 
 lint:
 	scripts/lint.sh

@@ -20,9 +20,9 @@
 //      from shared memory each tile (fewer registers, used when MT * D is large).  -> q_frag
 //   5. The S accumulator is re-packed in registers as the A operand of P V: the
 //      C-fragment layout of mma m16n8 matches the A-fragment layout, so P never
-//      touches shared memory.                                                      -> PV loop
+//      touches shared memory.                                                      -> p_h
 //   6. cp.async with the FA2 pipeline: V_j loads while S = Q K_j^T runs, K_{j+1}
-//      loads while softmax and P V_j run.                                          -> main loop
+//      loads while softmax and P V_j run.                                          -> tile()
 //   7. XOR swizzle of 16-byte chunks in shared memory: ldmatrix and cp.async are
 //      both bank-conflict-free with no padding.                                    -> swizzle()
 //   8. Softmax in base 2: exp(x*scale - m) == exp2(x*scale*log2e - m'), and
@@ -34,6 +34,21 @@
 //      and run in reverse order, so the longest blocks start first.                -> need_mask
 //  11. Output is staged through shared memory and written with 16-byte coalesced
 //      stores.                                                                     -> epilogue
+//
+// Beyond FA2: optional features selected per variant by the Opt template parameter
+// (docs/optimizations.md, "Beyond FA2", has the measurements):
+//  12. PEEL:   masked tiles run in a separate loop, so the main loop has no mask code.
+//  13. STAGES: 2 = double-buffered K and V; the whole next tile is prefetched while the
+//              current one is computed (2 barriers per tile instead of 3).
+//  14. LAZY:   FA4's conditional rescaling: O is only rescaled when a row max grows by more
+//              than 2^8; otherwise the stale max is kept (exact: l uses the same max).
+//  15. EXP16:  ex2.approx.f16x2 computes two probabilities per SFU instruction and gives
+//              P already packed as the fp16 mma operand.
+//  16. EMU:    FA4's software exp2: half of the exponentials run as a polynomial on the FMA
+//              pipe, splitting the load between the FMA units and the SFU.
+//  17. ACC16:  P V accumulated in fp16 (2x tensor throughput on GeForce GPUs) for one tile,
+//              then added into the fp32 O accumulator: only BC/16 fp16 roundings per tile,
+//              and no fp16 overflow however long the sequence.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -44,6 +59,7 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "../common.cuh"
 #include "../flash_fwd.h"
@@ -51,7 +67,8 @@
 namespace fa {
 namespace {
 
-template <int D_, int WARPS_, int MT_, int BC_, bool Q_IN_REGS_>
+// Tile shape.
+template <int D_, int WARPS_, int MT_, int BC_, bool Q_IN_REGS_, int STAGES_ = 1>
 struct Config {
     static constexpr int D = D_;          // head dim
     static constexpr int WARPS = WARPS_;  // warps per block
@@ -62,10 +79,30 @@ struct Config {
     static constexpr int BC = BC_;                 // key rows per tile
     static constexpr bool Q_IN_REGS = Q_IN_REGS_;  // keep Q fragments in registers
     static constexpr int CHUNKS = D / 8;           // 16-byte chunks (8 halfs) per row
-    static constexpr int SMEM_BYTES = (BR + 2 * BC) * D * static_cast<int>(sizeof(half));
+    // Pipeline depth: part of the tile config because it costs shared memory, and whether
+    // that is affordable depends on the tile (it halves occupancy at d = 128, BR = 128).
+    static constexpr int STAGES = STAGES_;
+    static_assert(STAGES == 1 || STAGES == 2, "1 (FA2 pipeline) or 2 (double-buffered K/V)");
     static_assert(D == 64 || D == 128, "head dim must be 64 or 128");
     static_assert(BC % 16 == 0, "BC must be a multiple of the mma K/N tile");
 };
+
+// Optional features (numbered 12-17 in the header comment).
+template <bool PEEL_, bool LAZY_, bool EXP16_, bool EMU_, bool ACC16_>
+struct Opt {
+    static constexpr bool PEEL = PEEL_;
+    static constexpr bool LAZY = LAZY_;
+    static constexpr bool EXP16 = EXP16_;
+    static constexpr bool EMU = EMU_;
+    static constexpr bool ACC16 = ACC16_;
+    // LAZY lets p grow to 2^8; a 64-term fp16 sum of p * v could then overflow fp16.
+    static_assert(!(LAZY && ACC16), "lazy rescaling needs fp32 accumulation");
+};
+
+template <class Cfg, class O>
+constexpr int smem_bytes() {
+    return (Cfg::BR + (2 * Cfg::STAGES * Cfg::BC)) * Cfg::D * static_cast<int>(sizeof(half));
+}
 
 // The swizzled shared-memory layout, swizzle<D>(row, chunk), is in common.cuh.
 
@@ -101,9 +138,20 @@ __device__ __forceinline__ void load_q_frag(uint32_t (&a)[4], const half* s_q, i
     ptx::ldmatrix_x4(a, ptx::smem_addr(s_q + swizzle<D>(row, chunk)));
 }
 
+// B fragments of V for keys [16kk, 16kk+16) and head-dim columns [16dp, 16dp+16): V is
+// [key][d] row-major, the mma wants k = key, so ldmatrix.trans. b[0..1]: n-tile 2dp,
+// b[2..3]: n-tile 2dp+1.
+template <int D>
+__device__ __forceinline__ void load_v_frag(uint32_t (&b)[4], const half* s_v, int kk, int dp,
+                                            int lane) {
+    const int row = (kk * 16) + (lane & 7) + (((lane >> 3) & 1) << 3);
+    const int chunk = (dp * 2) + (lane >> 4);
+    ptx::ldmatrix_x4_trans(b, ptx::smem_addr(s_v + swizzle<D>(row, chunk)));
+}
+
 // One long kernel on purpose: the loops are fully unrolled into straight-line register code,
 // and splitting it into functions would only hide the data flow between the stages.
-template <class Cfg, bool CAUSAL>
+template <class Cfg, class O, bool CAUSAL>
 __global__ void __launch_bounds__(Cfg::THREADS)
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     flash_fwd_kernel(const half* __restrict__ q, const half* __restrict__ k,
@@ -115,14 +163,15 @@ __global__ void __launch_bounds__(Cfg::THREADS)
     constexpr int THREADS = Cfg::THREADS;
     constexpr int CHUNKS = Cfg::CHUNKS;
     constexpr int WARP_ROWS = Cfg::WARP_ROWS;
+    constexpr int STAGES = Cfg::STAGES;
 
     // Dynamic shared memory is declared this way in CUDA (size set at launch); it is per
     // block, not a real global, and the kernel writes it, so it cannot be const.
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
     extern __shared__ __align__(128) unsigned char smem_raw[];
     half* s_q = reinterpret_cast<half*>(smem_raw);  // [BR][D], later reused for the output
-    half* s_k = s_q + (BR * D);                     // [BC][D]
-    half* s_v = s_k + (BC * D);                     // [BC][D]
+    half* s_k0 = s_q + (BR * D);                    // [STAGES][BC][D]
+    half* s_v0 = s_k0 + (STAGES * BC * D);          // [STAGES][BC][D]
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid / 32;
@@ -144,9 +193,12 @@ __global__ void __launch_bounds__(Cfg::THREADS)
     const int kv_end = CAUSAL ? min(n, q0 + BR) : n;
     const int n_tiles = (kv_end + BC - 1) / BC;
 
-    // ---- Prologue: Q and K_0 -> shared (then Q -> registers) -----------------------------
+    // ---- Prologue: Q and K_0 (and V_0 when double-buffered) -> shared, Q -> registers ----
     load_tile<BR, D, THREADS>(s_q, q, q0, n, tid);
-    load_tile<BC, D, THREADS>(s_k, k, 0, n, tid);
+    load_tile<BC, D, THREADS>(s_k0, k, 0, n, tid);
+    if constexpr (STAGES == 2) {
+        load_tile<BC, D, THREADS>(s_v0, v, 0, n, tid);
+    }
     ptx::cp_async_commit();
     ptx::cp_async_wait<0>();
     __syncthreads();
@@ -188,13 +240,33 @@ __global__ void __launch_bounds__(Cfg::THREADS)
         row_sum[mt][0] = row_sum[mt][1] = 0.0F;
     }
 
-    // ---- Main loop over key/value tiles -----------------------------------------------------
-    for (int j = 0; j < n_tiles; ++j) {
+    // ---- One key/value tile -------------------------------------------------------------
+    // mask_tag is std::true_type / std::false_type: with PEEL the unmasked tiles get a copy
+    // of this body with no mask code at all. need_mask is the runtime check otherwise.
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): same reason as the kernel
+    auto tile = [&](int j, auto mask_tag, bool need_mask) {
+        constexpr bool MASK_CODE = decltype(mask_tag)::value;
         const int k0 = j * BC;
+        const int stage = (STAGES == 2) ? (j & 1) : 0;
+        const half* s_k = s_k0 + (stage * BC * D);
+        const half* s_v = s_v0 + (stage * BC * D);
 
-        // V_j starts loading now and overlaps with S = Q K_j^T.
-        load_tile<BC, D, THREADS>(s_v, v, k0, n, tid);
-        ptx::cp_async_commit();
+        if constexpr (STAGES == 1) {
+            // V_j starts loading now and overlaps with S = Q K_j^T.
+            load_tile<BC, D, THREADS>(s_v0, v, k0, n, tid);
+            ptx::cp_async_commit();
+        } else {
+            // Prefetch the whole next tile into the other buffer, then wait for this one
+            // (issued one iteration ago, or in the prologue).
+            if (j + 1 < n_tiles) {
+                const int next = (j + 1) & 1;
+                load_tile<BC, D, THREADS>(s_k0 + (next * BC * D), k, k0 + BC, n, tid);
+                load_tile<BC, D, THREADS>(s_v0 + (next * BC * D), v, k0 + BC, n, tid);
+            }
+            ptx::cp_async_commit();
+            ptx::cp_async_wait<1>();
+            __syncthreads();
+        }
 
         // S = Q K_j^T: per m-tile 16 x BC, BC/8 C fragments.
         // B operand = K^T, i.e. "col-major B" == K row-major, so ldmatrix (no .trans) on K.
@@ -240,29 +312,32 @@ __global__ void __launch_bounds__(Cfg::THREADS)
             }
         }
 
-        // All warps are done reading K_j: K_{j+1} can start loading and overlap with the
-        // softmax and P V_j. An empty group is committed on the last tile so the
-        // wait_group counts below are the same every iteration.
-        __syncthreads();
-        if (j + 1 < n_tiles) {
-            load_tile<BC, D, THREADS>(s_k, k, k0 + BC, n, tid);
+        if constexpr (STAGES == 1) {
+            // All warps are done reading K_j: K_{j+1} can start loading and overlap with the
+            // softmax and P V_j. An empty group is committed on the last tile so the
+            // wait_group counts below are the same every iteration.
+            __syncthreads();
+            if (j + 1 < n_tiles) {
+                load_tile<BC, D, THREADS>(s_k0, k, k0 + BC, n, tid);
+            }
+            ptx::cp_async_commit();
         }
-        ptx::cp_async_commit();
 
         // Masking: keys >= n (last tile) and, when causal, keys after the query.
-        const bool need_mask = (k0 + BC > n) || (CAUSAL && (k0 + BC - 1 > q0));
-        if (need_mask) {
+        if constexpr (MASK_CODE) {
+            if (need_mask) {
 #pragma unroll
-            for (int mt = 0; mt < MT; ++mt) {
-                const int row_a = q0 + warp_row0 + (mt * 16) + g;  // global query index
+                for (int mt = 0; mt < MT; ++mt) {
+                    const int row_a = q0 + warp_row0 + (mt * 16) + g;  // global query index
 #pragma unroll
-                for (int nt = 0; nt < BC / 8; ++nt) {
+                    for (int nt = 0; nt < BC / 8; ++nt) {
 #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const int col = k0 + (nt * 8) + (2 * t) + (e & 1);
-                        const int row = row_a + ((e >> 1) * 8);
-                        if (col >= n || (CAUSAL && col > row)) {
-                            s[mt][nt][e] = -INFINITY;
+                        for (int e = 0; e < 4; ++e) {
+                            const int col = k0 + (nt * 8) + (2 * t) + (e & 1);
+                            const int row = row_a + ((e >> 1) * 8);
+                            if (col >= n || (CAUSAL && col > row)) {
+                                s[mt][nt][e] = -INFINITY;
+                            }
                         }
                     }
                 }
@@ -271,6 +346,8 @@ __global__ void __launch_bounds__(Cfg::THREADS)
 
         // Online softmax. A row is spread over the 4 lanes of a group (t = 0..3), so the
         // max needs two butterfly shuffles; the sum can wait (see the epilogue).
+        // P comes out packed as fp16 pairs: p_h[mt][nt][0] = row g, [1] = row g+8.
+        uint32_t p_h[MT][BC / 8][2];
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             float tile_max[2] = {-INFINITY, -INFINITY};
@@ -279,69 +356,171 @@ __global__ void __launch_bounds__(Cfg::THREADS)
                 tile_max[0] = fmaxf(tile_max[0], fmaxf(s[mt][nt][0], s[mt][nt][1]));
                 tile_max[1] = fmaxf(tile_max[1], fmaxf(s[mt][nt][2], s[mt][nt][3]));
             }
-            float max_used[2];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                tile_max[i] = fmaxf(tile_max[i], __shfl_xor_sync(0xffffffffU, tile_max[i], 1));
-                tile_max[i] = fmaxf(tile_max[i], __shfl_xor_sync(0xffffffffU, tile_max[i], 2));
-                const float new_max = fmaxf(row_max[mt][i], tile_max[i] * scale_log2);
-                // A row that has seen only masked keys keeps max = -inf; use 0 so that
-                // (-inf) - (-inf) = NaN never happens. Its p values are exp2(-inf) = 0.
-                max_used[i] = (new_max == -INFINITY) ? 0.0F : new_max;
-                const float alpha = exp2f(row_max[mt][i] - max_used[i]);  // rescale old state
-                row_max[mt][i] = new_max;
-                row_sum[mt][i] *= alpha;
+            for (float& m : tile_max) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffU, m, 1));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffU, m, 2));
+            }
+
+            // FA4 conditional rescaling: if no row of this warp grows its max by more than
+            // 2^8 (8 in log2 units), keep the old max: p may then reach 2^8, which fp32 O
+            // and fp16 P hold easily, and skipping saves the rescale of all of O.
+            const bool rescale = [&] {
+                if constexpr (O::LAZY) {
+                    const bool grow = (tile_max[0] * scale_log2 > row_max[mt][0] + 8.0F) ||
+                                      (tile_max[1] * scale_log2 > row_max[mt][1] + 8.0F);
+                    return __any_sync(0xffffffffU, grow) != 0;
+                } else {
+                    return true;
+                }
+            }();
+            if (rescale) {
 #pragma unroll
-                for (int dn = 0; dn < D / 8; ++dn) {
-                    acc_o[mt][dn][2 * i] *= alpha;
-                    acc_o[mt][dn][(2 * i) + 1] *= alpha;
+                for (int i = 0; i < 2; ++i) {
+                    const float new_max = fmaxf(row_max[mt][i], tile_max[i] * scale_log2);
+                    // A row that has seen only masked keys keeps max = -inf; use 0 so that
+                    // (-inf) - (-inf) = NaN never happens. Its p values are exp2(-inf) = 0.
+                    const float alpha =
+                        exp2f(row_max[mt][i] - ((new_max == -INFINITY) ? 0.0F : new_max));
+                    row_max[mt][i] = new_max;
+                    row_sum[mt][i] *= alpha;
+#pragma unroll
+                    for (int dn = 0; dn < D / 8; ++dn) {
+                        acc_o[mt][dn][2 * i] *= alpha;
+                        acc_o[mt][dn][(2 * i) + 1] *= alpha;
+                    }
                 }
             }
+            const float max_used[2] = {(row_max[mt][0] == -INFINITY) ? 0.0F : row_max[mt][0],
+                                       (row_max[mt][1] == -INFINITY) ? 0.0F : row_max[mt][1]};
+
 #pragma unroll
             for (int nt = 0; nt < BC / 8; ++nt) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int i = e >> 1;
-                    s[mt][nt][e] = exp2f(fmaf(s[mt][nt][e], scale_log2, -max_used[i]));
-                    row_sum[mt][i] += s[mt][nt][e];
+                for (int i = 0; i < 2; ++i) {
+                    const float x0 = fmaf(s[mt][nt][2 * i], scale_log2, -max_used[i]);
+                    const float x1 = fmaf(s[mt][nt][(2 * i) + 1], scale_log2, -max_used[i]);
+                    if (O::EMU && (nt & 1) == 1) {
+                        // Every other n-tile on the FMA pipe instead of the SFU.
+                        const float p0 = ptx::exp2_poly3(x0);
+                        const float p1 = ptx::exp2_poly3(x1);
+                        row_sum[mt][i] += p0 + p1;
+                        p_h[mt][nt][i] = ptx::pack_half2(p0, p1);
+                    } else if constexpr (O::EXP16) {
+                        // Two exponentials in one SFU instruction, result already packed.
+                        p_h[mt][nt][i] = ptx::ex2_f16x2(ptx::pack_half2(x0, x1));
+                        const float2 p = ptx::unpack_half2(p_h[mt][nt][i]);
+                        row_sum[mt][i] += p.x + p.y;
+                    } else {
+                        const float p0 = exp2f(x0);
+                        const float p1 = exp2f(x1);
+                        row_sum[mt][i] += p0 + p1;
+                        p_h[mt][nt][i] = ptx::pack_half2(p0, p1);
+                    }
                 }
             }
         }
 
-        // Wait for V_j (the newest group, K_{j+1}, may stay in flight), then O += P V_j.
-        ptx::cp_async_wait<1>();
-        __syncthreads();
+        if constexpr (STAGES == 1) {
+            // Wait for V_j (the newest group, K_{j+1}, may stay in flight).
+            ptx::cp_async_wait<1>();
+            __syncthreads();
+        }
 
-        // P as the A operand: the C fragments of key n-tiles 2kk and 2kk+1 are exactly the
-        // a[0..1] and a[2..3] halves of a 16x16 A fragment over keys 16kk..16kk+15.
-        // B operand = V (k = key, n = head dim) is row-major in smem, so ldmatrix.trans.
-#pragma unroll
-        for (int kk = 0; kk < BC / 16; ++kk) {
-            uint32_t a[MT][4];
-#pragma unroll
-            for (int mt = 0; mt < MT; ++mt) {
-                a[mt][0] = ptx::pack_half2(s[mt][2 * kk][0], s[mt][2 * kk][1]);
-                a[mt][1] = ptx::pack_half2(s[mt][2 * kk][2], s[mt][2 * kk][3]);
-                a[mt][2] = ptx::pack_half2(s[mt][(2 * kk) + 1][0], s[mt][(2 * kk) + 1][1]);
-                a[mt][3] = ptx::pack_half2(s[mt][(2 * kk) + 1][2], s[mt][(2 * kk) + 1][3]);
-            }
+        // O += P V_j. P as the A operand: the C fragments of key n-tiles 2kk and 2kk+1 are
+        // exactly the a[0..1] and a[2..3] halves of a 16x16 A fragment over keys
+        // 16kk..16kk+15.
+        auto a_of = [&](int mt, int kk, uint32_t (&a)[4]) {
+            a[0] = p_h[mt][2 * kk][0];
+            a[1] = p_h[mt][2 * kk][1];
+            a[2] = p_h[mt][(2 * kk) + 1][0];
+            a[3] = p_h[mt][(2 * kk) + 1][1];
+        };
+        if constexpr (O::ACC16) {
+            // dp outer, kk inner: the fp16 partial sums of one 16-column slice live only
+            // for BC/16 mma steps, then get added into fp32 O (few extra registers).
 #pragma unroll
             for (int dp = 0; dp < D / 16; ++dp) {
-                uint32_t b[4];
-                const int row = (kk * 16) + (lane & 7) + (((lane >> 3) & 1) << 3);
-                const int chunk = (dp * 2) + (lane >> 4);
-                ptx::ldmatrix_x4_trans(b, ptx::smem_addr(s_v + swizzle<D>(row, chunk)));
+                uint32_t part[MT][2][2] = {};
+#pragma unroll
+                for (int kk = 0; kk < BC / 16; ++kk) {
+                    uint32_t b[4];
+                    load_v_frag<D>(b, s_v, kk, dp, lane);
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) {
+                        uint32_t a[4];
+                        a_of(mt, kk, a);
+                        ptx::mma_16816_f16acc(part[mt][0], a, b[0], b[1]);
+                        ptx::mma_16816_f16acc(part[mt][1], a, b[2], b[3]);
+                    }
+                }
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
-                    ptx::mma_16816(acc_o[mt][2 * dp], a[mt], b[0], b[1]);
-                    ptx::mma_16816(acc_o[mt][(2 * dp) + 1], a[mt], b[2], b[3]);
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const float2 lo = ptx::unpack_half2(part[mt][h][0]);  // row g
+                        const float2 hi = ptx::unpack_half2(part[mt][h][1]);  // row g+8
+                        float (&acc)[4] = acc_o[mt][(2 * dp) + h];
+                        acc[0] += lo.x;
+                        acc[1] += lo.y;
+                        acc[2] += hi.x;
+                        acc[3] += hi.y;
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int kk = 0; kk < BC / 16; ++kk) {
+                uint32_t a[MT][4];
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    a_of(mt, kk, a[mt]);
+                }
+#pragma unroll
+                for (int dp = 0; dp < D / 16; ++dp) {
+                    uint32_t b[4];
+                    load_v_frag<D>(b, s_v, kk, dp, lane);
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) {
+                        ptx::mma_16816(acc_o[mt][2 * dp], a[mt], b[0], b[1]);
+                        ptx::mma_16816(acc_o[mt][(2 * dp) + 1], a[mt], b[2], b[3]);
+                    }
                 }
             }
         }
 
-        // K_{j+1} has landed, and every warp is done with V_j before it is overwritten.
-        ptx::cp_async_wait<0>();
+        if constexpr (STAGES == 1) {
+            // K_{j+1} has landed, and every warp is done with V_j before it is overwritten.
+            ptx::cp_async_wait<0>();
+        }
+        // STAGES == 2: every warp is done with this stage before the next tile's prefetch
+        // overwrites it.
         __syncthreads();
+    };
+
+    // ---- Main loop over key/value tiles ---------------------------------------------------
+    auto needs_mask = [&](int j) {
+        const int k0 = j * BC;
+        return (k0 + BC > n) || (CAUSAL && (k0 + BC - 1 > q0));
+    };
+    if constexpr (O::PEEL) {
+        // Tiles [0, first_masked) need no mask, the rest (the last tile when n % BC != 0,
+        // the diagonal tiles when causal) do. (q0 + 1) / BC is the first tile with a key
+        // after query q0, i.e. the first one crossing the diagonal.
+        int first_masked = (n % BC != 0) ? n_tiles - 1 : n_tiles;
+        if constexpr (CAUSAL) {
+            first_masked = min(first_masked, (q0 + 1) / BC);
+        }
+        for (int j = 0; j < first_masked; ++j) {
+            tile(j, std::false_type{}, false);
+        }
+        for (int j = first_masked; j < n_tiles; ++j) {
+            tile(j, std::true_type{}, true);
+        }
+    } else {
+        for (int j = 0; j < n_tiles; ++j) {
+            tile(j, std::true_type{}, needs_mask(j));
+        }
     }
 
     // ---- Epilogue: normalize, stage through shared memory, 16-byte stores ---------------
@@ -381,10 +560,10 @@ __global__ void __launch_bounds__(Cfg::THREADS)
     }
 }
 
-template <class Cfg, bool CAUSAL>
+template <class Cfg, class O, bool CAUSAL>
 void launch(const FlashFwdParams& p, cudaStream_t stream) {
-    auto* kernel = flash_fwd_kernel<Cfg, CAUSAL>;
-    constexpr int smem = Cfg::SMEM_BYTES;
+    auto* kernel = flash_fwd_kernel<Cfg, O, CAUSAL>;
+    constexpr int smem = smem_bytes<Cfg, O>();
     // More than 48 KB of dynamic shared memory must be opted into explicitly.
     if constexpr (smem > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -398,27 +577,48 @@ void launch(const FlashFwdParams& p, cudaStream_t stream) {
     CUDA_CHECK_LAUNCH();
 }
 
-// Non-causal and causal use different tiles: causal blocks waste work on the diagonal
-// tile, which favours smaller BR.
-template <class Cfg, class CfgCausal>
-void dispatch_causal(const FlashFwdParams& p, cudaStream_t stream) {
-    if (p.causal) {
-        launch<CfgCausal, true>(p, stream);
-    } else {
-        launch<Cfg, false>(p, stream);
+// A kernel set = optional features + one tile shape per (head dim, causal). Non-causal and causal
+// use different tiles: causal blocks waste work on the diagonal tile, which favours smaller BR.
+template <class O, class D64, class D64Causal, class D128, class D128Causal>
+struct KernelSet {
+    static void run(const FlashFwdParams& p, cudaStream_t stream) {
+        if (p.head_dim == 64) {
+            p.causal ? launch<D64Causal, O, true>(p, stream) : launch<D64, O, false>(p, stream);
+        } else {
+            p.causal ? launch<D128Causal, O, true>(p, stream) : launch<D128, O, false>(p, stream);
+        }
     }
-}
+};
+
+// Tile configurations, chosen by benchmark (bench/tune.sh); see docs/benchmarking.md.
+// clang-format off
+// Features: measured one at a time with bench/ablate.sh (docs/fa3_fa4_techniques.md).
+//                    PEEL   LAZY   EXP16  EMU    ACC16
+using BaseOpt = Opt<false, false, false, false, false>;
+using OptOpt  = Opt<false, true,  false, false, false>;
+using FastOpt = Opt<false, false, true,  false, true>;
+//                                D  warps MT  BC  Q in regs  stages
+using BaseD64        = Config<64,  4, 2, 64, true,  1>;
+using BaseD64Causal  = Config<64,  4, 2, 64, true,  1>;
+using BaseD128       = Config<128, 4, 2, 32, false, 1>;
+using BaseD128Causal = Config<128, 4, 1, 64, true,  1>;
+using OptD64         = Config<64,  4, 2, 64, true,  1>;
+using OptD64Causal   = Config<64,  4, 2, 64, true,  1>;
+using OptD128        = Config<128, 4, 2, 32, false, 1>;
+using OptD128Causal  = Config<128, 4, 1, 64, true,  1>;
+using FastD64        = Config<64,  4, 2, 32, true,  2>;
+using FastD64Causal  = Config<64,  4, 2, 32, true,  2>;
+using FastD128       = Config<128, 4, 1, 64, true,  1>;
+using FastD128Causal = Config<128, 4, 1, 64, true,  1>;
+// clang-format on
+
+using BaseSet = KernelSet<BaseOpt, BaseD64, BaseD64Causal, BaseD128, BaseD128Causal>;
+using OptSet = KernelSet<OptOpt, OptD64, OptD64Causal, OptD128, OptD128Causal>;
+using FastSet = KernelSet<FastOpt, FastD64, FastD64Causal, FastD128, FastD128Causal>;
 
 bool aligned16(const void* ptr) {
     return (reinterpret_cast<uintptr_t>(ptr) % 16) == 0;
 }
-
-// Tile configurations, chosen by benchmark (bench/tune.sh); see docs/optimizations.md.
-//                              D  warps MT  BC  Q in regs
-using ConfigD64 = Config<64, 4, 2, 64, true>;
-using ConfigD64Causal = Config<64, 4, 2, 64, true>;
-using ConfigD128 = Config<128, 4, 2, 32, false>;
-using ConfigD128Causal = Config<128, 4, 1, 64, true>;
 
 }  // namespace
 
@@ -432,16 +632,22 @@ void flash_fwd(const FlashFwdParams& p, cudaStream_t stream) {
     if (!aligned16(p.q) || !aligned16(p.k) || !aligned16(p.v) || !aligned16(p.o)) {
         throw std::invalid_argument("flash_fwd: tensors must be 16-byte aligned (cp.async)");
     }
-    switch (p.head_dim) {
-        case 64:
-            dispatch_causal<ConfigD64, ConfigD64Causal>(p, stream);
+    if (p.head_dim != 64 && p.head_dim != 128) {
+        throw std::invalid_argument("flash_fwd: head_dim must be 64 or 128, got " +
+                                    std::to_string(p.head_dim));
+    }
+    switch (p.variant) {
+        case Variant::kBaseline:
+            BaseSet::run(p, stream);
             break;
-        case 128:
-            dispatch_causal<ConfigD128, ConfigD128Causal>(p, stream);
+        case Variant::kOpt:
+            OptSet::run(p, stream);
+            break;
+        case Variant::kFp16Acc:
+            FastSet::run(p, stream);
             break;
         default:
-            throw std::invalid_argument("flash_fwd: head_dim must be 64 or 128, got " +
-                                        std::to_string(p.head_dim));
+            throw std::invalid_argument("flash_fwd: unknown variant");
     }
 }
 

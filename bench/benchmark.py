@@ -32,8 +32,17 @@ def _sdpa(backend):
     return run
 
 
+def _ours(variant):
+    def run(q, k, v, causal):
+        return fa.forward_variant(q, k, v, causal=causal, variant=variant)
+
+    return run
+
+
 IMPLS = {
-    "fa (ours)": lambda q, k, v, causal: fa.forward(q, k, v, causal=causal),
+    "fa fp16-acc (ours)": _ours("fp16acc"),
+    "fa opt (ours)": _ours("opt"),
+    "fa baseline (ours)": _ours("baseline"),
     "sdpa-flash (FA2)": _sdpa(SDPBackend.FLASH_ATTENTION),
     "sdpa-cudnn": _sdpa(SDPBackend.CUDNN_ATTENTION),
     "sdpa-efficient": _sdpa(SDPBackend.EFFICIENT_ATTENTION),
@@ -103,7 +112,7 @@ def main():
                     torch.randn(b, h, n, d, device="cuda", dtype=torch.half, generator=gen)
                     for _ in range(3)
                 )
-                ref_out = fa.forward(q, k, v, causal=causal)
+                ref_out = fa.forward_variant(q, k, v, causal=causal, variant="baseline")
                 del q, k, v
                 line = [f"d={d:3d} causal={int(causal)} N={n:5d} B={b:2d} H={h:2d} |"]
                 for name in args.impl:

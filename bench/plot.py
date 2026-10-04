@@ -16,10 +16,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-OURS = "fa (ours)"
+OURS = "fa opt (ours)"
+OURS_FP16 = "fa fp16-acc (ours)"
+OURS_BASE = "fa baseline (ours)"
 FA2 = "sdpa-flash (FA2)"
 STYLE = {
+    OURS_FP16: dict(color="darkred", marker="*", linewidth=2.5, markersize=10),
     OURS: dict(color="tab:red", marker="o", linewidth=2.5),
+    OURS_BASE: dict(color="salmon", marker="o", linestyle="--"),
     FA2: dict(color="tab:blue", marker="s"),
     "sdpa-cudnn": dict(color="tab:green", marker="^"),
     "sdpa-efficient": dict(color="tab:purple", marker="v"),
@@ -28,7 +32,7 @@ STYLE = {
 
 
 def plot(df: pd.DataFrame, gpu: str) -> Path:
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.8), sharey=True)
     for (i, d), (j, causal) in [((i, d), (j, c)) for i, d in enumerate([64, 128]) for j, c in enumerate([0, 1])]:
         ax = axes[i][j]
         sub = df[(df.d == d) & (df.causal == causal) & (df.status == "ok")]
@@ -40,9 +44,11 @@ def plot(df: pd.DataFrame, gpu: str) -> Path:
         ax.set_xlabel("sequence length N")
         ax.set_ylabel("TFLOPS")
         ax.grid(alpha=0.3)
-    axes[0][0].legend()
+    # One shared legend under the panels, so it never covers a line.
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False)
     fig.suptitle(f"Attention forward, fp16, B*N = 16k, H*d = 2048 — {gpu}")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     out = ROOT / "docs" / "img" / f"{gpu.replace(' ', '_')}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=120)
@@ -54,13 +60,18 @@ def table(df: pd.DataFrame) -> str:
     ok = df[df.status == "ok"]
     piv = ok.pivot_table(index=["d", "causal", "N"], columns="impl", values="tflops")
     impls = [c for c in STYLE if c in piv.columns]
-    lines = ["| d | causal | N | " + " | ".join(impls) + " | ours / FA2 |",
-             "|---|---|---|" + "---|" * len(impls) + "---|"]
+    lines = ["| d | causal | N | " + " | ".join(impls) + " | opt / FA2 | fp16-acc / FA2 |",
+             "|---|---|---|" + "---|" * len(impls) + "---|---|"]
     for (d, causal, n), row in piv.iterrows():
         cells = [f"{row[c]:.1f}" if pd.notna(row[c]) else "OOM" for c in impls]
-        ratio = row.get(OURS) / row.get(FA2) if FA2 in row and pd.notna(row.get(FA2)) else float("nan")
-        cells = [f"**{c}**" if impls[k] == OURS else c for k, c in enumerate(cells)]
-        lines.append(f"| {d} | {causal} | {n} | " + " | ".join(cells) + f" | {ratio:.2f}x |")
+        def ratio(name):
+            if name in row and FA2 in row and pd.notna(row.get(name)) and pd.notna(row.get(FA2)):
+                return f"{row[name] / row[FA2]:.2f}x"
+            return "-"
+
+        cells = [f"**{c}**" if impls[k] in (OURS, OURS_FP16) else c for k, c in enumerate(cells)]
+        lines.append(f"| {d} | {causal} | {n} | " + " | ".join(cells)
+                     + f" | {ratio(OURS)} | {ratio(OURS_FP16)} |")
     return "\n".join(lines)
 
 

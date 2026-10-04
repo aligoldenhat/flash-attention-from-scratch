@@ -90,12 +90,25 @@ struct Shape {
     int n;
     int d;
     bool causal;
+    fa::Variant variant = fa::Variant::kOpt;
 };
+
+const char* variant_name(fa::Variant v) {
+    switch (v) {
+        case fa::Variant::kBaseline:
+            return "baseline";
+        case fa::Variant::kOpt:
+            return "opt";
+        case fa::Variant::kFp16Acc:
+            return "fp16acc";
+    }
+    return "?";
+}
 
 // How GoogleTest (and ctest's test names) print a Shape, instead of a raw byte dump.
 void PrintTo(const Shape& s, std::ostream* os) {
     *os << "B" << s.batch << "_H" << s.heads << "_N" << s.n << "_D" << s.d
-        << (s.causal ? "_causal" : "_full");
+        << (s.causal ? "_causal_" : "_full_") << variant_name(s.variant);
 }
 
 // Exact attention in double precision for all rows. Small shapes only.
@@ -159,7 +172,9 @@ TEST_P(FlashFwdVsCpu, MatchesReference) {
     CUDA_CHECK(cudaMemcpy(t.q, q.data(), elems * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(t.k, k.data(), elems * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(t.v, v.data(), elems * sizeof(half), cudaMemcpyHostToDevice));
-    fa::flash_fwd(make_params(t, s.batch, s.heads, s.n, s.d, s.causal), nullptr);
+    auto params = make_params(t, s.batch, s.heads, s.n, s.d, s.causal);
+    params.variant = s.variant;
+    fa::flash_fwd(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<half> o(elems);
     CUDA_CHECK(cudaMemcpy(o.data(), t.o, elems * sizeof(half), cudaMemcpyDeviceToHost));
@@ -174,18 +189,24 @@ TEST_P(FlashFwdVsCpu, MatchesReference) {
 
 // N chosen to hit: a single row, a partial Q tile and partial K/V tile, exact multiples of
 // the tiles, and several tiles with a partial last one; each for both head dims and causal.
-INSTANTIATE_TEST_SUITE_P(Shapes, FlashFwdVsCpu,
-                         ::testing::Values(Shape{1, 1, 1, 64, false}, Shape{1, 1, 1, 128, true},
-                                           Shape{1, 2, 65, 64, false}, Shape{1, 2, 65, 64, true},
-                                           Shape{2, 1, 128, 128, false},
-                                           Shape{2, 1, 128, 128, true}, Shape{1, 2, 257, 64, true},
-                                           Shape{1, 2, 300, 128, false},
-                                           Shape{1, 2, 300, 128, true}),
-                         [](const ::testing::TestParamInfo<Shape>& param_info) {
-                             const Shape& s = param_info.param;
-                             return "B" + std::to_string(s.batch) + "H" + std::to_string(s.heads) +
-                                    "N" + std::to_string(s.n) + "D" + std::to_string(s.d) +
-                                    (s.causal ? "causal" : "full");
-                         });
+// Every shape on every kernel build (baseline, opt, fp16acc).
+std::vector<Shape> all_shapes() {
+    // Positional rows read better than designated initializers in a table like this.
+    // NOLINTBEGIN(modernize-use-designated-initializers)
+    const Shape base[] = {{1, 1, 1, 64, false},  {1, 1, 1, 128, true},    {1, 2, 65, 64, false},
+                          {1, 2, 65, 64, true},  {2, 1, 128, 128, false}, {2, 1, 128, 128, true},
+                          {1, 2, 257, 64, true}, {1, 2, 300, 128, false}, {1, 2, 300, 128, true}};
+    // NOLINTEND(modernize-use-designated-initializers)
+    std::vector<Shape> out;
+    for (const auto v : {fa::Variant::kBaseline, fa::Variant::kOpt, fa::Variant::kFp16Acc}) {
+        for (Shape s : base) {
+            s.variant = v;
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
+INSTANTIATE_TEST_SUITE_P(Shapes, FlashFwdVsCpu, ::testing::ValuesIn(all_shapes()));
 
 }  // namespace

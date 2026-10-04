@@ -15,8 +15,11 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -86,6 +89,8 @@ __device__ uint32_t pack(half lo, half hi) {
 //   b0 = B[2t..2t+1][g]  b1 = B[2t+8..2t+9][g]
 //   c0,c1 = C[g][2t..2t+1]  c2,c3 = C[g+8][2t..2t+1]
 // ---------------------------------------------------------------------------------------------
+// F16ACC: the fp16-accumulate mma (C as 2 half2 registers: row g and row g+8).
+template <bool F16ACC>
 __global__ void mma_from_layout_table(const half* a_mat /*16x16*/, const half* b_mat /*16x8*/,
                                       float* c_mat /*16x8*/) {
     const int lane = static_cast<int>(threadIdx.x);
@@ -102,14 +107,26 @@ __global__ void mma_from_layout_table(const half* a_mat /*16x16*/, const half* b
     const uint32_t b0 = pack(B(2 * t, g), B((2 * t) + 1, g));
     const uint32_t b1 = pack(B((2 * t) + 8, g), B((2 * t) + 9, g));
     float d[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-    fa::ptx::mma_16816(d, a, b0, b1);
+    if constexpr (F16ACC) {
+        uint32_t d16[2] = {0U, 0U};
+        fa::ptx::mma_16816_f16acc(d16, a, b0, b1);
+        const float2 row_g = fa::ptx::unpack_half2(d16[0]);
+        const float2 row_g8 = fa::ptx::unpack_half2(d16[1]);
+        d[0] = row_g.x;
+        d[1] = row_g.y;
+        d[2] = row_g8.x;
+        d[3] = row_g8.y;
+    } else {
+        fa::ptx::mma_16816(d, a, b0, b1);
+    }
     c_mat[(g * 8) + (2 * t)] = d[0];
     c_mat[(g * 8) + (2 * t) + 1] = d[1];
     c_mat[((g + 8) * 8) + (2 * t)] = d[2];
     c_mat[((g + 8) * 8) + (2 * t) + 1] = d[3];
 }
 
-TEST(Mma16816, FragmentLayoutMatchesCpuMatmul) {
+template <bool F16ACC>
+void check_mma_layout() {
     std::vector<half> a(16 * 16);
     std::vector<half> b(16 * 8);
     std::vector<float> a_f(a.size());
@@ -125,7 +142,7 @@ TEST(Mma16816, FragmentLayoutMatchesCpuMatmul) {
     const DeviceBuffer<half> d_a(a);
     const DeviceBuffer<half> d_b(b);
     const DeviceBuffer<float> d_c(16 * 8);
-    mma_from_layout_table<<<1, kWarp>>>(d_a.get(), d_b.get(), d_c.get());
+    mma_from_layout_table<F16ACC><<<1, kWarp>>>(d_a.get(), d_b.get(), d_c.get());
     sync_and_check();
 
     const auto c = d_c.to_host();
@@ -138,6 +155,15 @@ TEST(Mma16816, FragmentLayoutMatchesCpuMatmul) {
             EXPECT_EQ(c[idx(r, 8, n)], expected) << "C[" << r << "][" << n << "]";
         }
     }
+}
+
+TEST(Mma16816, FragmentLayoutMatchesCpuMatmul) {
+    check_mma_layout<false>();
+}
+
+// Same products (|C| <= 96, exact in fp16), through the fp16-accumulate instruction.
+TEST(Mma16816, F16AccumulateFragmentLayoutMatchesCpuMatmul) {
+    check_mma_layout<true>();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -322,6 +348,78 @@ TEST(CpAsync, SrcSizeZeroWritesZeros) {
     for (size_t i = 0; i < 8; ++i) {
         EXPECT_EQ(__half2float(out[i]), static_cast<float>(i + 1)) << "copied element " << i;
         EXPECT_EQ(__half2float(out[8 + i]), 0.0F) << "zero-filled element " << i;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exponentials: the FA4-style polynomial exp2 (FMA pipe) and ex2.approx.f16x2 (SFU, packed).
+// ---------------------------------------------------------------------------------------------
+__global__ void exp2_kernels(const float* x, float* poly, float* f16x2, int n) {
+    const int i = static_cast<int>((blockIdx.x * blockDim.x) + threadIdx.x);
+    if (2 * i + 1 < n) {
+        poly[2 * i] = fa::ptx::exp2_poly3(x[2 * i]);
+        poly[(2 * i) + 1] = fa::ptx::exp2_poly3(x[(2 * i) + 1]);
+        const float2 r = fa::ptx::unpack_half2(
+            fa::ptx::ex2_f16x2(fa::ptx::pack_half2(x[2 * i], x[(2 * i) + 1])));
+        f16x2[2 * i] = r.x;
+        f16x2[(2 * i) + 1] = r.y;
+    }
+}
+
+struct Exp2Results {
+    std::vector<float> x;
+    std::vector<float> poly;
+    std::vector<float> f16x2;
+};
+
+// x from -30 to +8 (lazy rescaling lets p reach 2^8), plus -inf (masked scores).
+Exp2Results run_exp2() {
+    Exp2Results r;
+    for (int i = 0; i <= 3800; ++i) {
+        r.x.push_back(-30.0F + (static_cast<float>(i) * 0.01F));
+    }
+    r.x.push_back(-std::numeric_limits<float>::infinity());
+    r.x.push_back(-1000.0F);
+    if (r.x.size() % 2 != 0) {
+        r.x.push_back(0.0F);
+    }
+    const auto n = static_cast<int>(r.x.size());
+    const DeviceBuffer<float> d_x(r.x);
+    const DeviceBuffer<float> d_poly(r.x.size());
+    const DeviceBuffer<float> d_f16(r.x.size());
+    const auto blocks = static_cast<unsigned>(((n / 2) + 255) / 256);
+    exp2_kernels<<<blocks, 256>>>(d_x.get(), d_poly.get(), d_f16.get(), n);
+    sync_and_check();
+    r.poly = d_poly.to_host();
+    r.f16x2 = d_f16.to_host();
+    return r;
+}
+
+TEST(Exp2, PolynomialRelativeErrorBelowFp16Resolution) {
+    const auto r = run_exp2();
+    double worst = 0.0;
+    for (size_t i = 0; i < r.x.size(); ++i) {
+        const double expected = std::exp2(static_cast<double>(r.x[i]));
+        if (expected == 0.0 || expected < 1e-30) {
+            EXPECT_LT(r.poly[i], 1e-30F) << "x = " << r.x[i];
+            continue;
+        }
+        const double rel = std::fabs(static_cast<double>(r.poly[i]) - expected) / expected;
+        worst = std::max(worst, rel);
+    }
+    // fp16 resolves 2^-11 = 4.9e-4; P is rounded to fp16 right after, so 2e-4 is invisible.
+    EXPECT_LT(worst, 2e-4) << "worst relative error " << worst;
+}
+
+TEST(Exp2, F16x2MatchesExp2WithinFp16Precision) {
+    const auto r = run_exp2();
+    for (size_t i = 0; i < r.x.size(); ++i) {
+        const double expected = std::exp2(static_cast<double>(r.x[i]));
+        const auto got = static_cast<double>(r.f16x2[i]);
+        // Relative error near fp16 resolution for normal results; absolute for tiny ones
+        // (the input x itself is rounded to fp16, which costs up to ~2e-3 relative at |x|=8).
+        const double tol = std::max(4e-3 * expected, 1e-6);
+        EXPECT_NEAR(got, expected, tol) << "x = " << r.x[i];
     }
 }
 

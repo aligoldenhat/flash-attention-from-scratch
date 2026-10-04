@@ -10,28 +10,36 @@ PyTorch.
 - Online softmax in base 2. Causal masking only on diagonal tiles, with masked tiles skipped.
   N need not be a multiple of the tile size.
 - FP16 in, FP32 accumulate, head dim 64 / 128, causal and non-causal, tile shapes tuned per case.
+- Optional **fp16-accumulate P·V** variant that uses GeForce GPUs' 2× fp16-accumulate tensor rate.
+  FA3/FA4 techniques (lazy rescaling, software exp2, deeper pipelining) were each tried and measured.
 
 ```python
 import fa
-o = fa.forward(q, k, v, causal=True)   # q, k, v: [B, H, N, d] fp16 CUDA tensors, d in {64, 128}
+o = fa.forward(q, k, v, causal=True)                    # exact: fp32 accumulation
+o = fa.forward(q, k, v, causal=True, fp16_accum=True)   # faster on GeForce GPUs
+# q, k, v: [B, H, N, d] fp16 CUDA tensors, d in {64, 128}
 ```
 
 ## Results (RTX 3050 Laptop, sm_86)
 
 ![benchmark](docs/img/NVIDIA_GeForce_RTX_3050_Laptop_GPU.png)
 
-Faster than PyTorch SDPA's FlashAttention-2 backend at all 24 benchmarked shapes:
-**1.01–1.06x non-causal, 1.02–1.11x causal**. That's 14.5–14.8 TFLOPS at large N, equal to a
-cuBLAS fp16 GEMM on this GPU (14.5 TFLOPS). Full table, method and caveats are in
-[docs/benchmarking.md](docs/benchmarking.md).
+Against PyTorch SDPA's FlashAttention-2 backend, at all 24 benchmarked shapes:
 
-| d=128, N=16k | ours | FA2 (SDPA flash) | cuDNN | mem-efficient | naive torch |
-|---|---|---|---|---|---|
-| non-causal | **14.5** | 14.3 | 13.7 | 9.3 | OOM |
-| causal | **14.0** | 12.7 | 13.3 | 8.9 | OOM |
+- **fp16-acc: 1.25–1.43x FA2**, up to 19.5 TFLOPS.
+- **opt (exact, fp32 accumulate): 1.02–1.13x FA2**, 14.5–14.8 TFLOPS at large N. That equals a
+  cuBLAS fp16 GEMM on this GPU (14.5 TFLOPS), the fp32-accumulate ceiling.
+
+Full table, method and caveats are in [docs/benchmarking.md](docs/benchmarking.md).
+
+| d=128, N=16k | ours fp16-acc | ours opt | FA2 (SDPA flash) | cuDNN | mem-efficient | naive torch |
+|---|---|---|---|---|---|---|
+| non-causal | **17.9** | **14.6** | 14.2 | 13.7 | 9.3 | OOM |
+| causal | **17.9** | **14.1** | 12.5 | 13.0 | 8.8 | OOM |
 
 FlashAttention-3/4 need Hopper/datacenter-Blackwell hardware and don't run on consumer GPUs, so
-FA2 is the bar here. RTX 4090 / 5090 numbers are coming.
+FA2 is the bar here; which of their ideas carry over, and what each one measured, is in
+[docs/fa3_fa4_techniques.md](docs/fa3_fa4_techniques.md). RTX 4090 / 5090 numbers are coming.
 
 ## Quick start
 
@@ -52,6 +60,7 @@ make profile      # Nsight Compute reports (needs sudo for GPU counters)
 | Doc | Contents |
 |---|---|
 | [docs/optimizations.md](docs/optimizations.md) | how the kernel works, every optimization and why |
+| [docs/fa3_fa4_techniques.md](docs/fa3_fa4_techniques.md) | FA3/FA4 techniques on consumer GPUs, ablation results, number formats (fp32/fp16/bf16/fp8/fp4) |
 | [docs/benchmarking.md](docs/benchmarking.md) | baselines, method, full results, tile tuning |
 | [docs/testing.md](docs/testing.md) | pytest, GoogleTest building-block tests, sanitizers |
 | [docs/profiling.md](docs/profiling.md) | Nsight Compute / Systems scripts and what to look for |
